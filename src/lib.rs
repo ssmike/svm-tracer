@@ -17,6 +17,7 @@ use {
 
 mod syscall_decode;
 use mollusk_svm::InvocationInspectCallback;
+use solana_program_runtime::solana_sbpf::program::BuiltinProgram;
 use syscall_decode::{translate_signers_c, translate_instruction_c, translate_signers_rust, translate_instruction_rust};
 
 // Initial memory layout for an instruction without stack and heap.
@@ -154,6 +155,39 @@ pub struct InstructionTraceBuilder {
 }
 
 impl InstructionTraceBuilder {
+    // prepares programs environment for tracing and returns an old env
+    pub fn prepare_for_tracing(mollusk: &mut Mollusk) -> BuiltinProgram<InvokeContext<'static>> {
+        let (env, old_env) = {
+            let mut config = mollusk.program_cache.program_runtime_environment.get_config().clone();
+            let old_config = config.clone();
+            let mut old_loader = BuiltinProgram::new_loader(old_config);
+
+            config.enable_instruction_tracing = true;
+            let mut loader = BuiltinProgram::new_loader(config);
+
+            for (_key, (name, value)) in mollusk
+                .program_cache
+                .program_runtime_environment
+                .get_function_registry()
+                .iter()
+            {
+                let name = std::str::from_utf8(name).unwrap();
+                old_loader.register_function(name, value).unwrap();
+                match name {
+                    "sol_invoke_signed_c" => loader.register_function(name, SyscallInvokeSignedCStub::vm),
+                    "sol_invoke_signed_rust" => loader.register_function(name, SyscallInvokeSignedRustStub::vm),
+                    _ => loader.register_function(name, value)
+                }.unwrap();
+            }
+
+            (loader, old_loader)
+        };
+
+        mollusk.program_cache.program_runtime_environment = env;
+
+        old_env
+    }
+
     pub fn build(mollusk: &mut Mollusk, instruction: &Instruction, accounts: &[(Pubkey, Account)]) -> InstructionTrace {
         let this = Self {
             trace: RefCell::new(Some(InstructionTrace::default())).into()
@@ -163,6 +197,7 @@ impl InstructionTraceBuilder {
         this.trace.borrow_mut().as_mut().unwrap().configure(mollusk);
 
         let mut cb: Box<dyn InvocationInspectCallback> = Box::new(this);
+
         mem::swap(&mut cb, &mut mollusk.invocation_inspect_callback);
         let result = mollusk.process_instruction(instruction, accounts);
         trace.borrow_mut().as_mut().unwrap().result.absorb(result);
