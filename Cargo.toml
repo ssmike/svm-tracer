@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mollusk-svm = { path = "../mollusk/harness", version = "0.4.0", features = ["invocation-inspect-callback"] }
+mollusk-svm = { version = "0.4.0", features = ["invocation-inspect-callback"] }
 agave-feature-set = "2.3"
 solana-program-runtime = "2.3"
 solana-instruction = "2.2"
@@ -15,3 +15,6 @@ mollusk-svm-error = { version = "0.4.0" }
 solana-account = "2.2"
 solana-bpf-loader-program = "2.3"
 solana-stable-layout = "2.2.1"
+
+[patch.crates-io]
+mollusk-svm = { git = "https://github.com/anza-xyz/mollusk" }
