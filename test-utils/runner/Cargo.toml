@@ -1,0 +1,11 @@
+[package]
+name = "runner"
+edition = { workspace = true }
+
+[dependencies]
+mollusk-svm = { workspace = true }
+solana-sdk = { workspace = true }
+solana-program-runtime.workspace = true
+solana-compute-budget = {workspace = true}
+agave-feature-set = {workspace = true}
+svm-tracer = { workspace = true }

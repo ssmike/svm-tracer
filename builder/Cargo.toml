@@ -1,0 +1,17 @@
+[package]
+name = "svm-tracer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mollusk-svm = { workspace = true }
+agave-feature-set = { workspace = true }
+solana-program-runtime = { workspace = true }
+solana-instruction = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-transaction-context = {workspace = true }
+solana-compute-budget = {workspace = true }
+mollusk-svm-error = { workspace = true }
+solana-account = {workspace = true }
+solana-bpf-loader-program = {workspace = true }
+solana-stable-layout = {workspace = true }
