@@ -1,20 +1,24 @@
-[package]
-name = "svm-tracer"
-version = "0.1.0"
+[workspace]
+resolver = "2"
+members = [
+    "builder",
+    "test-utils/*",
+]
+
+[workspace.package]
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
 mollusk-svm = { version = "0.4.0", features = ["invocation-inspect-callback"] }
 agave-feature-set = "2.3"
 solana-program-runtime = "2.3"
 solana-instruction = "2.2"
 solana-pubkey = "2.2"
+solana-sdk = "2.3"
 solana-transaction-context = "2.3"
 solana-compute-budget = "2.3"
 mollusk-svm-error = { version = "0.4.0" }
 solana-account = "2.2"
 solana-bpf-loader-program = "2.3"
 solana-stable-layout = "2.2.1"
-
-[patch.crates-io]
-mollusk-svm = { git = "https://github.com/anza-xyz/mollusk" }
+svm-tracer = { path = "builder" }
