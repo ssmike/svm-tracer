@@ -3,10 +3,11 @@ resolver = "2"
 members = [
     "builder",
     "test-utils/*",
+    "test-programs/*",
 ]
 
 [workspace.package]
-edition = "2024"
+edition = "2021"
 
 [workspace.dependencies]
 mollusk-svm = { version = "0.4.0", features = ["invocation-inspect-callback"] }
@@ -22,3 +23,10 @@ solana-account = "2.2"
 solana-bpf-loader-program = "2.3"
 solana-stable-layout = "2.2.1"
 svm-tracer = { path = "builder" }
+
+solana-account-info = "2.2"
+solana-program-entrypoint = "2.2"
+solana-program-error = "2.2"
+solana-cpi = "2.2"
+solana-sdk-ids = "2.2"
+solana-system-interface = "1.0"

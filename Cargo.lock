@@ -4217,6 +4217,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-program-cpi-target"
+version = "0.1.0"
+dependencies = [
+ "solana-account-info",
+ "solana-program-entrypoint",
+ "solana-program-error",
+ "solana-pubkey",
+]
+
+[[package]]
+name = "test-program-custom-syscall"
+version = "0.1.0"
+dependencies = [
+ "solana-account-info",
+ "solana-program-entrypoint",
+ "solana-program-error",
+ "solana-pubkey",
+]
+
+[[package]]
+name = "test-program-epoch-stake"
+version = "0.1.0"
+dependencies = [
+ "solana-account-info",
+ "solana-program-entrypoint",
+ "solana-program-error",
+ "solana-pubkey",
+]
+
+[[package]]
+name = "test-program-primary"
+version = "0.1.0"
+dependencies = [
+ "solana-account-info",
+ "solana-cpi",
+ "solana-instruction",
+ "solana-program-entrypoint",
+ "solana-program-error",
+ "solana-pubkey",
+ "solana-sdk-ids",
+ "solana-system-interface",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"

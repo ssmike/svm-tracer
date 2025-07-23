@@ -1,4 +1,4 @@
-use std::{alloc::alloc_zeroed, mem};
+use std::{alloc::alloc_zeroed, error::Error, mem};
 
 use {
     agave_feature_set::FeatureSet,
@@ -17,7 +17,7 @@ use {
 
 mod syscall_decode;
 use mollusk_svm::InvocationInspectCallback;
-use solana_program_runtime::solana_sbpf::{aligned_memory::AlignedMemory, program::BuiltinProgram};
+use solana_program_runtime::solana_sbpf::{aligned_memory::{AlignedMemory, Pod}, program::BuiltinProgram};
 use syscall_decode::{translate_signers_c, translate_instruction_c, translate_signers_rust, translate_instruction_rust};
 
 
@@ -45,14 +45,68 @@ impl AddressSpace {
         }
         None
     }
+
+    pub fn replay(&mut self, op: MemoryAccess) {
+        match op {
+            MemoryAccess::Write{value, vmaddr, size, ..} => {
+                let phy_addr = self.translate_vmaddr(vmaddr, size as u64, Some(false)).unwrap();
+                macro_rules! perform_write {
+                    ($ty:ty) => {
+                        unsafe {
+                            std::ptr::write_unaligned(phy_addr as *mut $ty, value as $ty);
+                        }
+                    }
+                }
+                match size {
+                    1 => perform_write!(u8),
+                    2 => perform_write!(u16),
+                    4 => perform_write!(u32),
+                    8 => perform_write!(u64),
+                    _ => {}
+                }
+            },
+            _ => {}
+        };
+    }
+}
+
+impl Clone for AddressSpace {
+    fn clone(&self) -> Self {
+        let mut regions: Vec<MemoryRegion> = vec![];
+        let mem = self.mem.clone();
+
+        for region in regions.as_mut_slice() {
+            let mut regions_found = 0;
+            for i in 0..mem.len() {
+                let slice = self.mem[i].as_slice();
+                let start = slice.as_ptr() as u64;
+                let size = slice.len() as u64;
+                let addr = region.host_addr.get();
+                if start <= addr && addr <= start + size {
+                    region.host_addr.set(mem[i].as_slice().as_ptr() as u64);
+                    regions_found += 1;
+                }
+            }
+            assert!(regions_found == 1);
+        }
+
+        Self {
+            regions,
+            mem,
+            accounts: self.accounts.clone(),
+            text: self.text.clone(),
+            text_vmaddr: self.text_vmaddr
+        }
+    }
 }
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum MemoryAccess {
     Read{
         size: u8,
-        value: u64
+        vmaddr: u64,
+        value: u64,
     },
     Write{
         size: u8,
@@ -63,15 +117,25 @@ pub enum MemoryAccess {
 }
 
 #[derive(Debug)]
+pub enum Syscall {
+}
+
+#[derive(Debug)]
 pub struct TraceEntry {
     pub regs_after: [u64; 12],
     pub regs_before: [u64; 12],
     pub insn: solana_sbpf::ebpf::Insn,
 
     pub mem: Option<MemoryAccess>,
+    pub syscall: Option<Syscall>,
 }
 
 impl TraceEntry {
+    #[inline]
+    fn load<T: Pod + Into<u64>>(&self, phy_addr: u64) -> u64 {
+        unsafe { std::ptr::read_unaligned::<T>(phy_addr as *const _) }.into()
+    }
+
     fn fill_memory_access(&mut self, next: &Self, address_space: &AddressSpace, move_memory_instruction_classes: bool) {
         self.regs_after = next.regs_before;
 
@@ -80,36 +144,50 @@ impl TraceEntry {
 
         let mut mem: Option<MemoryAccess> = None;
 
-        let mut fill_memory_access = |vmaddr: u64, len: u8, load: bool, value: u64|  {
-            assert!(address_space.translate_vmaddr(vmaddr, len.into(), Some(load)).is_some());
-            if load {
-                mem = Some(MemoryAccess::Read{size: len, value});
-            } else {
-                mem = Some(MemoryAccess::Write { size: len, vmaddr, before: 0, value });
+        macro_rules! fill_mem_read {
+            ($vmaddr:ident, $typ:ty, $value:expr) => {
+                {
+                    let len = std::mem::size_of::<$typ>();
+                    let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(true)).unwrap();
+                    let value = $value as $typ as u64;
+                    mem = Some(MemoryAccess::Read{size: len as u8, value, vmaddr:$vmaddr});
+                    assert!(self.load::<$typ>(phy_addr) == value);
+                }
             }
-        };
+        }
+        macro_rules! fill_mem_write {
+            ($vmaddr:ident, $typ:ty, $value:expr) => {
+                {
+                    let len = std::mem::size_of::<$typ>() as u8;
+                    let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(false)).unwrap();
+                    let value = $value as $typ as u64;
+                    let before = self.load::<$typ>(phy_addr);
+                    mem = Some(MemoryAccess::Write { size: len, vmaddr: $vmaddr, before, value });
+                }
+            }
+        }
 
         if !move_memory_instruction_classes {
             let src_addr = (self.regs_before[src] as i64).wrapping_add(self.insn.off as i64) as u64;
             let dst_addr = (self.regs_before[dst] as i64).wrapping_add(self.insn.off as i64) as u64;
 
             match self.insn.opc {
-                solana_sbpf::ebpf::LD_B_REG => fill_memory_access(src_addr, 1, true, self.regs_after[dst]),
-                solana_sbpf::ebpf::LD_H_REG => fill_memory_access(src_addr, 2, true, self.regs_after[dst]),
-                solana_sbpf::ebpf::LD_W_REG => fill_memory_access(src_addr, 4, true, self.regs_after[dst]),
-                solana_sbpf::ebpf::LD_DW_REG => fill_memory_access(src_addr, 8, true, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_B_REG => fill_mem_read!(src_addr, u8, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_H_REG => fill_mem_read!(src_addr, u16, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_W_REG => fill_mem_read!(src_addr, u32, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_DW_REG => fill_mem_read!(src_addr, u64, self.regs_after[dst]),
 
                 // BPF_ST class
-                solana_sbpf::ebpf::ST_B_IMM => fill_memory_access(dst_addr, 1, false, self.insn.imm as u8 as u64),
-                solana_sbpf::ebpf::ST_H_IMM => fill_memory_access(dst_addr, 2, false, self.insn.imm as u16 as u64),
-                solana_sbpf::ebpf::ST_W_IMM => fill_memory_access(dst_addr, 4, false, self.insn.imm as u32 as u64),
-                solana_sbpf::ebpf::ST_DW_IMM => fill_memory_access(dst_addr, 8, false, self.insn.imm as u64),
+                solana_sbpf::ebpf::ST_B_IMM => fill_mem_write!(dst_addr, u8, self.insn.imm),
+                solana_sbpf::ebpf::ST_H_IMM => fill_mem_write!(dst_addr, u16, self.insn.imm),
+                solana_sbpf::ebpf::ST_W_IMM => fill_mem_write!(dst_addr, u32, self.insn.imm),
+                solana_sbpf::ebpf::ST_DW_IMM => fill_mem_write!(dst_addr, u64, self.insn.imm),
 
                 // BPF_STX class
-                solana_sbpf::ebpf::ST_B_REG => fill_memory_access(dst_addr, 1, false, self.regs_before[src] as u8 as u64),
-                solana_sbpf::ebpf::ST_H_REG => fill_memory_access(dst_addr, 2, false, self.regs_before[src] as u16 as u64),
-                solana_sbpf::ebpf::ST_W_REG => fill_memory_access(dst_addr, 4, false, self.regs_before[src] as u32 as u64),
-                solana_sbpf::ebpf::ST_DW_REG => fill_memory_access(dst_addr, 8, false, self.regs_before[src] as u64),
+                solana_sbpf::ebpf::ST_B_REG => fill_mem_write!(dst_addr, u8, self.regs_before[src]),
+                solana_sbpf::ebpf::ST_H_REG => fill_mem_write!(dst_addr, u16, self.regs_before[src]),
+                solana_sbpf::ebpf::ST_W_REG => fill_mem_write!(dst_addr, u32, self.regs_before[src]),
+                solana_sbpf::ebpf::ST_DW_REG => fill_mem_write!(dst_addr, u64, self.regs_before[src]),
 
                 _ => { }
             }
@@ -120,15 +198,19 @@ impl TraceEntry {
             let dst_addr = (self.regs_before[dst] as i64).wrapping_add(self.insn.off as i64) as u64;
 
             match self.insn.opc {
-                solana_sbpf::ebpf::LD_1B_REG => fill_memory_access(src_addr, 1, true, self.regs_after[dst]),
-                solana_sbpf::ebpf::LD_2B_REG => fill_memory_access(src_addr, 2, true, self.regs_after[dst]),
-                solana_sbpf::ebpf::LD_4B_REG => fill_memory_access(src_addr, 4, true, self.regs_after[dst]),
-                solana_sbpf::ebpf::LD_8B_REG => fill_memory_access(src_addr, 8, true, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_1B_REG => fill_mem_read!(src_addr, u8, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_2B_REG => fill_mem_read!(src_addr, u16, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_4B_REG => fill_mem_read!(src_addr, u32, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_8B_REG => fill_mem_read!(src_addr, u64, self.regs_after[dst]),
 
-                solana_sbpf::ebpf::ST_1B_IMM | solana_sbpf::ebpf::ST_1B_REG => fill_memory_access(dst_addr, 1, false),
-                solana_sbpf::ebpf::ST_2B_IMM | solana_sbpf::ebpf::ST_2B_REG => fill_memory_access(dst_addr, 2, false),
-                solana_sbpf::ebpf::ST_4B_IMM | solana_sbpf::ebpf::ST_4B_REG => fill_memory_access(dst_addr, 4, false),
-                solana_sbpf::ebpf::ST_8B_IMM | solana_sbpf::ebpf::ST_8B_REG => fill_memory_access(dst_addr, 8, false),
+                solana_sbpf::ebpf::ST_1B_IMM => fill_mem_write!(dst_addr, u8, self.insn.imm),
+                solana_sbpf::ebpf::ST_1B_REG => fill_mem_write!(dst_addr, u8, self.regs_before[src]),
+                solana_sbpf::ebpf::ST_2B_IMM => fill_mem_write!(dst_addr, u16, self.insn.imm),
+                solana_sbpf::ebpf::ST_2B_REG => fill_mem_write!(dst_addr, u16, self.regs_before[src]),
+                solana_sbpf::ebpf::ST_4B_IMM => fill_mem_write!(dst_addr, u16, self.insn.imm),
+                solana_sbpf::ebpf::ST_4B_REG => fill_mem_write!(dst_addr, u32, self.regs_before[src]),
+                solana_sbpf::ebpf::ST_8B_IMM => fill_mem_write!(dst_addr, u64, self.insn.imm),
+                solana_sbpf::ebpf::ST_8B_REG => fill_mem_write!(dst_addr, u64, self.regs_before[src]),
 
                 _ => { }
             }
@@ -148,7 +230,8 @@ impl TraceEntry {
             regs_before: *regs,
             regs_after: *regs,
             insn,
-            mem: None
+            mem: None,
+            syscall: None
         }
     }
 }
@@ -450,11 +533,17 @@ impl InstructionTrace {
             |regs| TraceEntry::new(regs, &self.address_space[frame_number]))
                 .collect::<Vec<TraceEntry>>();
         let slice = &mut self.entries[frame_number];
+        let mut address_space = self.address_space[frame_number].clone();
         for i in 0..slice.len() {
-            let slice = &mut slice[i..i+1];
-            let (fs, sc) = slice.split_at_mut(1);
-            if !sc.is_empty() && !fs.is_empty() {
-                fs[0].fill_memory_access(&sc[0], &self.address_space[frame_number], self.conf[frame_number].move_memory_instruction_classes);
+            {
+                let slice = &mut slice[i..i+1];
+                let (fs, sc) = slice.split_at_mut(1);
+                if !sc.is_empty() && !fs.is_empty() {
+                    fs[0].fill_memory_access(&sc[0], &address_space, self.conf[frame_number].move_memory_instruction_classes);
+                }
+            }
+            if let Some(op@MemoryAccess::Write {..}) = &slice[i].mem {
+                address_space.replay(op.clone())
             }
         }
     }
