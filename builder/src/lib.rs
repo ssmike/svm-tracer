@@ -1,4 +1,4 @@
-use std::mem;
+use std::{alloc::alloc_zeroed, mem};
 
 use {
     agave_feature_set::FeatureSet,
@@ -7,40 +7,34 @@ use {
     solana_account::Account,
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_instruction::{AccountMeta, Instruction, error::InstructionError},
-    solana_program_runtime::{invoke_context::{EnvironmentConfig, InvokeContext, SerializedAccountMetadata},
+    solana_program_runtime::{invoke_context::{InvokeContext, SerializedAccountMetadata},
     loaded_programs::ProgramCacheEntryOwner, serialization::serialize_parameters, solana_sbpf::{self, declare_builtin_function, memory_region::{MemoryMapping, MemoryRegion}}},
     solana_pubkey::Pubkey,
-    solana_transaction_context::{IndexOfAccount, InstructionAccount, InstructionContext, TransactionContext},
+    solana_transaction_context::{InstructionAccount, InstructionContext},
     solana_bpf_loader_program::syscalls::{SyscallInvokeSignedC, SyscallInvokeSignedRust},
-    std::{cell::RefCell, collections::HashSet, iter::once, rc::Rc},
+    std::{cell::RefCell, rc::Rc},
 };
 
 mod syscall_decode;
 use mollusk_svm::InvocationInspectCallback;
-use solana_program_runtime::solana_sbpf::program::BuiltinProgram;
+use solana_program_runtime::solana_sbpf::{aligned_memory::AlignedMemory, program::BuiltinProgram};
 use syscall_decode::{translate_signers_c, translate_instruction_c, translate_signers_rust, translate_instruction_rust};
+
 
 // Initial memory layout for an instruction without stack and heap.
 #[derive(Debug, Default)]
 pub struct AddressSpace {
     pub regions: Vec<MemoryRegion>,
     pub accounts: Vec<SerializedAccountMetadata>,
-    mem: Option<solana_sbpf::aligned_memory::AlignedMemory<{solana_sbpf::ebpf::HOST_ALIGN}>>,
+    mem: Vec<AlignedMemory<{solana_sbpf::ebpf::HOST_ALIGN}>>,
 
     pub text_vmaddr: u64,
     pub text: Vec<u8>,
-
-    pub data_region: MemoryRegion,
-    pub data: Vec<u8>,
-
-    // MemoryRegions without backing memory
-    stack: MemoryRegion,
-    heap: MemoryRegion,
 }
 
 impl AddressSpace {
     fn translate_vmaddr(&self, addr: u64, len: u64, load: Option<bool>) -> Option<u64> {
-        for r in self.regions.as_slice().iter().chain(vec![&self.stack, &self.heap].into_iter()) {
+        for r in self.regions.as_slice().iter() {
             if let Some(addr) = r.vm_to_host(addr, len) {
                 return match load {
                     Some(true) => Some(addr),
@@ -53,81 +47,108 @@ impl AddressSpace {
     }
 }
 
+
+#[derive(Debug)]
+pub enum MemoryAccess {
+    Read{
+        size: u8,
+        value: u64
+    },
+    Write{
+        size: u8,
+        vmaddr: u64,
+        before: u64,
+        value: u64
+    }
+}
+
 #[derive(Debug)]
 pub struct TraceEntry {
-    pub regs: [u64; 12],
+    pub regs_after: [u64; 12],
+    pub regs_before: [u64; 12],
     pub insn: solana_sbpf::ebpf::Insn,
 
-    // mem address. filled only for load/store operations
-    pub vaddr: Option<u64>
+    pub mem: Option<MemoryAccess>,
 }
 
 impl TraceEntry {
-    fn new(address_space: &AddressSpace, regs: &[u64; 12], move_memory_instruction_classes: bool) -> Self {
-        let mut insn = solana_sbpf::ebpf::get_insn_unchecked(address_space.text.as_slice(), regs[11] as usize);
-        if insn.opc == solana_sbpf::ebpf::LD_DW_IMM {
-            solana_sbpf::ebpf::augment_lddw_unchecked(address_space.text.as_slice(), &mut insn);
-        }
+    fn fill_memory_access(&mut self, next: &Self, address_space: &AddressSpace, move_memory_instruction_classes: bool) {
+        self.regs_after = next.regs_before;
 
-        let src = insn.src as usize;
-        let dst = insn.dst as usize;
+        let src = self.insn.src as usize;
+        let dst = self.insn.dst as usize;
 
-        let mut vaddr: Option<u64> = None;
+        let mut mem: Option<MemoryAccess> = None;
 
-        let mut fill_memory_access = |vmaddr: u64, len: u64, load: bool|  {
-            assert!(address_space.translate_vmaddr(vmaddr, len, Some(load)).is_some());
-            vaddr = Some(vmaddr);
+        let mut fill_memory_access = |vmaddr: u64, len: u8, load: bool, value: u64|  {
+            assert!(address_space.translate_vmaddr(vmaddr, len.into(), Some(load)).is_some());
+            if load {
+                mem = Some(MemoryAccess::Read{size: len, value});
+            } else {
+                mem = Some(MemoryAccess::Write { size: len, vmaddr, before: 0, value });
+            }
         };
 
         if !move_memory_instruction_classes {
-            let src_addr = (regs[src] as i64).wrapping_add(insn.off as i64) as u64;
-            let dst_addr = (regs[dst] as i64).wrapping_add(insn.off as i64) as u64;
+            let src_addr = (self.regs_before[src] as i64).wrapping_add(self.insn.off as i64) as u64;
+            let dst_addr = (self.regs_before[dst] as i64).wrapping_add(self.insn.off as i64) as u64;
 
-            match insn.opc {
-                solana_sbpf::ebpf::LD_B_REG => fill_memory_access(src_addr, 1, true),
-                solana_sbpf::ebpf::LD_H_REG => fill_memory_access(src_addr, 2, true),
-                solana_sbpf::ebpf::LD_W_REG => fill_memory_access(src_addr, 4, true),
-                solana_sbpf::ebpf::LD_DW_REG => fill_memory_access(src_addr, 8, true),
+            match self.insn.opc {
+                solana_sbpf::ebpf::LD_B_REG => fill_memory_access(src_addr, 1, true, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_H_REG => fill_memory_access(src_addr, 2, true, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_W_REG => fill_memory_access(src_addr, 4, true, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_DW_REG => fill_memory_access(src_addr, 8, true, self.regs_after[dst]),
 
                 // BPF_ST class
-                solana_sbpf::ebpf::ST_B_IMM => fill_memory_access(dst_addr, 1, false),
-                solana_sbpf::ebpf::ST_H_IMM => fill_memory_access(dst_addr, 2, false),
-                solana_sbpf::ebpf::ST_W_IMM => fill_memory_access(dst_addr, 4, false),
-                solana_sbpf::ebpf::ST_DW_IMM => fill_memory_access(dst_addr, 8, false),
+                solana_sbpf::ebpf::ST_B_IMM => fill_memory_access(dst_addr, 1, false, self.insn.imm as u8 as u64),
+                solana_sbpf::ebpf::ST_H_IMM => fill_memory_access(dst_addr, 2, false, self.insn.imm as u16 as u64),
+                solana_sbpf::ebpf::ST_W_IMM => fill_memory_access(dst_addr, 4, false, self.insn.imm as u32 as u64),
+                solana_sbpf::ebpf::ST_DW_IMM => fill_memory_access(dst_addr, 8, false, self.insn.imm as u64),
 
                 // BPF_STX class
-                solana_sbpf::ebpf::ST_B_REG => fill_memory_access(dst_addr, 1, false),
-                solana_sbpf::ebpf::ST_H_REG => fill_memory_access(dst_addr, 2, false),
-                solana_sbpf::ebpf::ST_W_REG => fill_memory_access(dst_addr, 4, false),
-                solana_sbpf::ebpf::ST_DW_REG => fill_memory_access(dst_addr, 8, false),
+                solana_sbpf::ebpf::ST_B_REG => fill_memory_access(dst_addr, 1, false, self.regs_before[src] as u8 as u64),
+                solana_sbpf::ebpf::ST_H_REG => fill_memory_access(dst_addr, 2, false, self.regs_before[src] as u16 as u64),
+                solana_sbpf::ebpf::ST_W_REG => fill_memory_access(dst_addr, 4, false, self.regs_before[src] as u32 as u64),
+                solana_sbpf::ebpf::ST_DW_REG => fill_memory_access(dst_addr, 8, false, self.regs_before[src] as u64),
 
                 _ => { }
             }
         };
 
         if move_memory_instruction_classes {
-            let src_addr = (regs[src] as i64).wrapping_add(insn.off as i64) as u64;
-            let dst_addr = (regs[dst] as i64).wrapping_add(insn.off as i64) as u64;
+            let src_addr = (self.regs_before[src] as i64).wrapping_add(self.insn.off as i64) as u64;
+            let dst_addr = (self.regs_before[dst] as i64).wrapping_add(self.insn.off as i64) as u64;
 
-            match insn.opc {
-                solana_sbpf::ebpf::LD_1B_REG => fill_memory_access(src_addr, 1, false),
-                solana_sbpf::ebpf::LD_2B_REG => fill_memory_access(src_addr, 2, false),
-                solana_sbpf::ebpf::LD_4B_REG => fill_memory_access(src_addr, 4, false),
-                solana_sbpf::ebpf::LD_8B_REG => fill_memory_access(src_addr, 8, false),
+            match self.insn.opc {
+                solana_sbpf::ebpf::LD_1B_REG => fill_memory_access(src_addr, 1, true, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_2B_REG => fill_memory_access(src_addr, 2, true, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_4B_REG => fill_memory_access(src_addr, 4, true, self.regs_after[dst]),
+                solana_sbpf::ebpf::LD_8B_REG => fill_memory_access(src_addr, 8, true, self.regs_after[dst]),
 
-                solana_sbpf::ebpf::ST_1B_IMM | solana_sbpf::ebpf::ST_1B_REG => fill_memory_access(dst_addr, 1, true),
-                solana_sbpf::ebpf::ST_2B_IMM | solana_sbpf::ebpf::ST_2B_REG => fill_memory_access(dst_addr, 2, true),
-                solana_sbpf::ebpf::ST_4B_IMM | solana_sbpf::ebpf::ST_4B_REG => fill_memory_access(dst_addr, 4, true),
-                solana_sbpf::ebpf::ST_8B_IMM | solana_sbpf::ebpf::ST_8B_REG => fill_memory_access(dst_addr, 8, true),
+                solana_sbpf::ebpf::ST_1B_IMM | solana_sbpf::ebpf::ST_1B_REG => fill_memory_access(dst_addr, 1, false),
+                solana_sbpf::ebpf::ST_2B_IMM | solana_sbpf::ebpf::ST_2B_REG => fill_memory_access(dst_addr, 2, false),
+                solana_sbpf::ebpf::ST_4B_IMM | solana_sbpf::ebpf::ST_4B_REG => fill_memory_access(dst_addr, 4, false),
+                solana_sbpf::ebpf::ST_8B_IMM | solana_sbpf::ebpf::ST_8B_REG => fill_memory_access(dst_addr, 8, false),
 
                 _ => { }
             }
         };
 
-        Self{ 
-            regs: *regs,
+        self.mem = mem;
+    }
+
+    fn new(regs: &[u64; 12], address_space: &AddressSpace) -> Self {
+        let mut insn = solana_sbpf::ebpf::get_insn_unchecked(address_space.text.as_slice(), regs[11] as usize);
+        if insn.opc == solana_sbpf::ebpf::LD_DW_IMM {
+            solana_sbpf::ebpf::augment_lddw_unchecked(address_space.text.as_slice(), &mut insn);
+        }
+
+
+        Self { 
+            regs_before: *regs,
+            regs_after: *regs,
             insn,
-            vaddr
+            mem: None
         }
     }
 }
@@ -202,7 +223,8 @@ impl InstructionTraceBuilder {
         let result = mollusk.process_instruction(instruction, accounts);
         trace.borrow_mut().as_mut().unwrap().result.absorb(result);
 
-        trace.borrow_mut().take().unwrap()
+        let result = trace.borrow_mut().take().unwrap();
+        result
     }
 }
 
@@ -354,31 +376,51 @@ impl InstructionTrace {
                 address_space.text_vmaddr = vmaddr;
                 address_space.text = text.to_vec();
 
-                let data = executable.get_ro_region();
-                assert!(data.vm_gap_shift == 63, "unexpected gap mode in elf ro region");
-                address_space.data = executable.get_ro_section().to_vec();
-                data.host_addr.set(address_space.data.as_slice().as_ptr() as u64);
-                address_space.data_region = data;
+                let ro_mem_region = executable.get_ro_region();
+                assert!(ro_mem_region.vm_gap_shift == 63, "unexpected gap mode in elf ro region");
+                let ro_mem = AlignedMemory::<{solana_sbpf::ebpf::HOST_ALIGN}>::from_slice(executable.get_ro_section());
 
-                let heap_size = self.compute_budget.heap_size as u64;
-                let stack_size = executable.get_config().stack_size() as u64;
+                // as we copied ro memory it should start in the same vmaddr
+                ro_mem_region.host_addr.set(ro_mem.as_slice().as_ptr() as u64);
+                address_space.mem.push(ro_mem);
+                address_space.regions.push(ro_mem_region);
 
-                address_space.heap = MemoryRegion::new_writable(&mut [], solana_sbpf::ebpf::MM_HEAP_START);
-                address_space.heap.len = heap_size;
-                address_space.heap.vm_addr_end = solana_sbpf::ebpf::MM_HEAP_START.saturating_add(heap_size);
+                let heap_size = self.compute_budget.heap_size as usize;
+                let stack_size = executable.get_config().stack_size() as usize;
 
+                // heap memory
+                let mut heap_memory = AlignedMemory::<{solana_sbpf::ebpf::HOST_ALIGN}>::with_capacity_zeroed(heap_size);
+                address_space.regions.push(MemoryRegion::new_writable(heap_memory.as_slice_mut(), solana_sbpf::ebpf::MM_HEAP_START));
+                address_space.mem.push(heap_memory);
+                //address_space.heap = MemoryRegion::new_writable(&mut [], solana_sbpf::ebpf::MM_HEAP_START);
+                //address_space.heap.len = heap_size;
+                //address_space.heap.vm_addr_end = solana_sbpf::ebpf::MM_HEAP_START.saturating_add(heap_size);
 
-                address_space.stack = MemoryRegion::new_writable_gapped(
-                    &mut [],
-                    solana_sbpf::ebpf::MM_STACK_START,
-                    if !executable.get_sbpf_version().dynamic_stack_frames() && executable.get_config().enable_stack_frame_gaps {
-                        stack_size
-                    } else {
-                        0
-                    },
+                // stack memory
+                let mut stack_memory = AlignedMemory::<{solana_sbpf::ebpf::HOST_ALIGN}>::with_capacity_zeroed(stack_size);
+                address_space.regions.push(
+                    MemoryRegion::new_writable_gapped(
+                        stack_memory.as_slice_mut(),
+                        solana_sbpf::ebpf::MM_STACK_START,
+                        if !executable.get_sbpf_version().dynamic_stack_frames() && executable.get_config().enable_stack_frame_gaps {
+                            stack_size as u64
+                        } else {
+                            0
+                        },
+                    )
                 );
-                address_space.stack.len = stack_size;
-                address_space.stack.vm_addr_end = solana_sbpf::ebpf::MM_STACK_START.saturating_add(stack_size);
+                address_space.mem.push(stack_memory);
+                //address_space.stack = MemoryRegion::new_writable_gapped(
+                //    &mut [],
+                //    solana_sbpf::ebpf::MM_STACK_START,
+                //    if !executable.get_sbpf_version().dynamic_stack_frames() && executable.get_config().enable_stack_frame_gaps {
+                //        stack_size
+                //    } else {
+                //        0
+                //    },
+                //);
+                //address_space.stack.len = stack_size;
+                //address_space.stack.vm_addr_end = solana_sbpf::ebpf::MM_STACK_START.saturating_add(stack_size);
 
                 self.conf.push(InstructionConf{ move_memory_instruction_classes: executable.get_sbpf_version().move_memory_instruction_classes() });
             },
@@ -392,7 +434,7 @@ impl InstructionTrace {
 
         let (serialized, regions, accounts_metadata) = serialize_parameters(ctx, &ictx, true, mask_out_rent_epoch_in_vm_serialization)?;
         
-        address_space.mem = Some(serialized);
+        address_space.mem.push(serialized);
         address_space.regions = regions;
         address_space.accounts = accounts_metadata;
 
@@ -405,8 +447,15 @@ impl InstructionTrace {
         let frame_number = self.pop_frame();
         let trace = ctx.get_traces().last().unwrap();
         self.entries[frame_number] = trace.iter().map(
-            |regs| TraceEntry::new(&self.address_space[frame_number], regs,
-                    self.conf[frame_number].move_memory_instruction_classes))
-            .collect::<Vec<TraceEntry>>();
+            |regs| TraceEntry::new(regs, &self.address_space[frame_number]))
+                .collect::<Vec<TraceEntry>>();
+        let slice = &mut self.entries[frame_number];
+        for i in 0..slice.len() {
+            let slice = &mut slice[i..i+1];
+            let (fs, sc) = slice.split_at_mut(1);
+            if !sc.is_empty() && !fs.is_empty() {
+                fs[0].fill_memory_access(&sc[0], &self.address_space[frame_number], self.conf[frame_number].move_memory_instruction_classes);
+            }
+        }
     }
 }
