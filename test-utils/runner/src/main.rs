@@ -80,7 +80,8 @@ fn main() {
     for trace in trace.entries {
         println!("frame");
         for entry in trace {
-            println!("regs {entry:?}")
+            let mem = entry.mem;
+            println!("{mem:?}")
         }
     }
 }

@@ -536,7 +536,7 @@ impl InstructionTrace {
         let mut address_space = self.address_space[frame_number].clone();
         for i in 0..slice.len() {
             {
-                let slice = &mut slice[i..i+1];
+                let slice = &mut slice[i..i+2];
                 let (fs, sc) = slice.split_at_mut(1);
                 if !sc.is_empty() && !fs.is_empty() {
                     fs[0].fill_memory_access(&sc[0], &address_space, self.conf[frame_number].move_memory_instruction_classes);
