@@ -1,4 +1,4 @@
-use std::{alloc::alloc_zeroed, error::Error, mem};
+use std::{alloc::alloc_zeroed, collections::BTreeMap, error::Error, mem};
 
 use {
     agave_feature_set::FeatureSet,
@@ -17,9 +17,16 @@ use {
 
 mod syscall_decode;
 use mollusk_svm::InvocationInspectCallback;
+use solana_bpf_loader_program::calculate_heap_cost;
 use solana_program_runtime::solana_sbpf::{aligned_memory::{AlignedMemory, Pod}, program::BuiltinProgram};
 use syscall_decode::{translate_signers_c, translate_instruction_c, translate_signers_rust, translate_instruction_rust};
 
+#[derive(Debug)]
+enum EmulationError {
+    AddressTranslationError{vmaddr: u64},
+    MemoryConsistencyCheck{vmaddr: u64, value: u64, cu_meter: u64},
+    InstructionError(InstructionError),
+}
 
 // Initial memory layout for an instruction without stack and heap.
 #[derive(Debug, Default)]
@@ -30,6 +37,16 @@ pub struct AddressSpace {
 
     pub text_vmaddr: u64,
     pub text: Vec<u8>,
+}
+
+#[inline]
+fn mload<T: Pod + Into<u64>>(phy_addr: u64) -> u64 {
+    unsafe { std::ptr::read_unaligned::<T>(phy_addr as *const _) }.into()
+}
+
+#[inline]
+fn mstore<T: Pod + Into<u64>>(phy_addr: u64, value: T) {
+    unsafe { std::ptr::write_unaligned::<T>(phy_addr as *mut T, value) }.into()
 }
 
 impl AddressSpace {
@@ -46,27 +63,22 @@ impl AddressSpace {
         None
     }
 
-    pub fn replay(&mut self, op: MemoryAccess) {
+    pub fn replay(&mut self, op: MemoryAccess) -> Result<(), EmulationError> {
         match op {
             MemoryAccess::Write{value, vmaddr, size, ..} => {
-                let phy_addr = self.translate_vmaddr(vmaddr, size as u64, Some(false)).unwrap();
-                macro_rules! perform_write {
-                    ($ty:ty) => {
-                        unsafe {
-                            std::ptr::write_unaligned(phy_addr as *mut $ty, value as $ty);
-                        }
-                    }
-                }
+                let phy_addr = self.translate_vmaddr(vmaddr, size as u64, Some(false)).ok_or(EmulationError::AddressTranslationError { vmaddr })?;
                 match size {
-                    1 => perform_write!(u8),
-                    2 => perform_write!(u16),
-                    4 => perform_write!(u32),
-                    8 => perform_write!(u64),
+                    1 => mstore(phy_addr, value as u8),
+                    2 => mstore(phy_addr, value as u16),
+                    4 => mstore(phy_addr, value as u32),
+                    8 => mstore(phy_addr, value as u64),
                     _ => {}
                 }
             },
             _ => {}
         };
+
+        Ok(())
     }
 }
 
@@ -75,19 +87,29 @@ impl Clone for AddressSpace {
         let mut regions: Vec<MemoryRegion> = vec![];
         let mem = self.mem.clone();
 
-        for region in regions.as_mut_slice() {
+        for region in self.regions.as_slice() {
             let mut regions_found = 0;
+            let mut host_addr: u64 = 0;
             for i in 0..mem.len() {
                 let slice = self.mem[i].as_slice();
                 let start = slice.as_ptr() as u64;
                 let size = slice.len() as u64;
                 let addr = region.host_addr.get();
                 if start <= addr && addr <= start + size {
-                    region.host_addr.set(mem[i].as_slice().as_ptr() as u64);
+                    host_addr = mem[i].as_slice().as_ptr() as u64;
                     regions_found += 1;
                 }
             }
             assert!(regions_found == 1);
+            regions.push(MemoryRegion {
+                host_addr: host_addr.into(),
+                vm_addr: region.vm_addr,
+                vm_addr_end: region.vm_addr_end,
+                len: region.len,
+                vm_gap_shift: region.vm_gap_shift,
+                writable: region.writable.clone(),
+                cow_callback_payload: region.cow_callback_payload
+            });
         }
 
         Self {
@@ -116,29 +138,45 @@ pub enum MemoryAccess {
     }
 }
 
-#[derive(Debug)]
-pub enum Syscall {
+#[derive(Debug, Clone)]
+pub enum SysCall {
+    MemCpy{dst: u64, src: u64, n: u64},
+    Unknown
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TraceEntry {
     pub regs_after: [u64; 12],
     pub regs_before: [u64; 12],
     pub insn: solana_sbpf::ebpf::Insn,
 
     pub mem: Option<MemoryAccess>,
-    pub syscall: Option<Syscall>,
+    pub syscall: Option<SysCall>,
+
+    // after execution
+    pub cu_meter: u64
 }
 
 impl TraceEntry {
-    #[inline]
-    fn load<T: Pod + Into<u64>>(&self, phy_addr: u64) -> u64 {
-        unsafe { std::ptr::read_unaligned::<T>(phy_addr as *const _) }.into()
+    fn fill_syscall(&mut self, registered_syscalls: &BTreeMap<u32, String>) {
+        let mut selected_call: Option<&str> = None;
+        let args = &self.regs_before[1..6];
+        if self.insn.opc == solana_sbpf::ebpf::SYSCALL {
+            selected_call = registered_syscalls.get(&(self.insn.imm as u32)).map(|r| r.as_str());
+        }
+        if self.insn.opc == solana_sbpf::ebpf::CALL_IMM {
+            selected_call = registered_syscalls.get(&(self.insn.imm as u32)).map(|r| r.as_str());
+        }
+        if let Some(selected_call) = selected_call { 
+            self.syscall = match selected_call {
+                "sol_memcpy_" => Some(SysCall::MemCpy { src: args[1], dst: args[0], n: args[2] }),
+                _ => Some(SysCall::Unknown)
+            };
+            println!("found syscall {:?}", self.syscall);
+        }
     }
 
-    fn fill_memory_access(&mut self, next: &Self, address_space: &AddressSpace, move_memory_instruction_classes: bool) {
-        self.regs_after = next.regs_before;
-
+    fn fill_memory_access(&mut self, address_space: &AddressSpace, move_memory_instruction_classes: bool) -> Result<(), EmulationError> {
         let src = self.insn.src as usize;
         let dst = self.insn.dst as usize;
 
@@ -148,10 +186,11 @@ impl TraceEntry {
             ($vmaddr:ident, $typ:ty, $value:expr) => {
                 {
                     let len = std::mem::size_of::<$typ>();
-                    let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(true)).unwrap();
+                    let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(true)).ok_or(EmulationError::AddressTranslationError{vmaddr:$vmaddr})?;
                     let value = $value as $typ as u64;
+                    //println!("load form vmaddr {} value {}/{} real value {}", $vmaddr, value, len, mload::<$typ>(phy_addr));
                     mem = Some(MemoryAccess::Read{size: len as u8, value, vmaddr:$vmaddr});
-                    assert!(self.load::<$typ>(phy_addr) == value);
+                    assert!(mload::<$typ>(phy_addr) == value);
                 }
             }
         }
@@ -159,14 +198,15 @@ impl TraceEntry {
             ($vmaddr:ident, $typ:ty, $value:expr) => {
                 {
                     let len = std::mem::size_of::<$typ>() as u8;
-                    let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(false)).unwrap();
+                    let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(false)).ok_or(EmulationError::AddressTranslationError{vmaddr:$vmaddr})?;
                     let value = $value as $typ as u64;
-                    let before = self.load::<$typ>(phy_addr);
+                    let before = mload::<$typ>(phy_addr);
+                    //println!("store vmaddr {} value {}/{} before {}", $vmaddr, value, len, before);
                     mem = Some(MemoryAccess::Write { size: len, vmaddr: $vmaddr, before, value });
                 }
             }
         }
-
+        
         if !move_memory_instruction_classes {
             let src_addr = (self.regs_before[src] as i64).wrapping_add(self.insn.off as i64) as u64;
             let dst_addr = (self.regs_before[dst] as i64).wrapping_add(self.insn.off as i64) as u64;
@@ -217,6 +257,8 @@ impl TraceEntry {
         };
 
         self.mem = mem;
+
+        Ok(())
     }
 
     fn new(regs: &[u64; 12], address_space: &AddressSpace) -> Self {
@@ -231,7 +273,8 @@ impl TraceEntry {
             regs_after: *regs,
             insn,
             mem: None,
-            syscall: None
+            syscall: None,
+            cu_meter: 0
         }
     }
 }
@@ -251,7 +294,12 @@ pub struct InstructionTrace {
     frame_number: Vec<usize>,
 
     feature_set: FeatureSet,
-    compute_budget: ComputeBudget
+    compute_budget: ComputeBudget,
+
+    registered_syscalls: BTreeMap<u32, String>,
+
+    pub cu_meter: u64,
+    pub cu_initial_value: u64
 }
 
 pub struct InstructionTraceBuilder {
@@ -297,7 +345,6 @@ impl InstructionTraceBuilder {
             trace: RefCell::new(Some(InstructionTrace::default())).into()
         };
         let trace = this.trace.clone();
-
         this.trace.borrow_mut().as_mut().unwrap().configure(mollusk);
 
         let mut cb: Box<dyn InvocationInspectCallback> = Box::new(this);
@@ -402,15 +449,40 @@ impl Default for InstructionTrace {
             conf: vec![],
             frame_number: vec![],
             feature_set: FeatureSet::default(),
-            compute_budget: ComputeBudget::default()
+            compute_budget: ComputeBudget::default(),
+            registered_syscalls: BTreeMap::new(),
+            cu_meter: 0,
+            cu_initial_value: 0,
         }
     }
 }
 
+pub fn debug_display_region(display: &str, r: &MemoryRegion) {
+    println!("{display} memory region {} {} / {}", r.vm_addr, r.vm_addr_end, r.vm_gap_shift);
+}
+
 impl InstructionTrace {
+    fn consume_cu(&mut self, value: u64) {
+        self.cu_meter = self.cu_meter.saturating_sub(value);
+    }
+
     fn configure(&mut self, mollusk: &Mollusk) {
+        for (key, (name, _)) in mollusk
+            .program_cache
+            .program_runtime_environment
+            .get_function_registry()
+            .iter()
+        {
+            self
+                .registered_syscalls
+                .insert(key, String::from_utf8(name.to_vec()).unwrap());
+            println!("syscall {key} {}", String::from_utf8(name.to_vec()).unwrap());
+        }
+
         self.feature_set = mollusk.feature_set.clone();
         self.compute_budget = mollusk.compute_budget.clone();
+        self.cu_meter = self.compute_budget.compute_unit_limit;
+        self.cu_initial_value = self.compute_budget.compute_unit_limit;
     }
 
     fn push_frame(&mut self) {
@@ -431,7 +503,6 @@ impl InstructionTrace {
         instruction_accounts: &[InstructionAccount],
         invoke_context: &InvokeContext) -> Result<(), InstructionError>
     {
-
         let program_indices = vec![invoke_context.transaction_context.find_index_of_account(program_id).unwrap()];
 
         let cache = &invoke_context.program_cache_for_tx_batch;
@@ -448,6 +519,8 @@ impl InstructionTrace {
         }
 
         let runtime_features = self.feature_set.runtime_features();
+        let heap_size = self.compute_budget.heap_size as usize;
+        self.consume_cu(calculate_heap_cost(heap_size as u32, self.compute_budget.to_cost().heap_cost));
 
         self.push_frame();
         let address_space = self.address_space.last_mut().unwrap();
@@ -463,47 +536,36 @@ impl InstructionTrace {
                 assert!(ro_mem_region.vm_gap_shift == 63, "unexpected gap mode in elf ro region");
                 let ro_mem = AlignedMemory::<{solana_sbpf::ebpf::HOST_ALIGN}>::from_slice(executable.get_ro_section());
 
-                // as we copied ro memory it should start in the same vmaddr
+                // as we copied ro memory it should start from the same vmaddr
                 ro_mem_region.host_addr.set(ro_mem.as_slice().as_ptr() as u64);
                 address_space.mem.push(ro_mem);
+                debug_display_region("romem", &ro_mem_region);
                 address_space.regions.push(ro_mem_region);
 
-                let heap_size = self.compute_budget.heap_size as usize;
                 let stack_size = executable.get_config().stack_size() as usize;
 
                 // heap memory
-                let mut heap_memory = AlignedMemory::<{solana_sbpf::ebpf::HOST_ALIGN}>::with_capacity_zeroed(heap_size);
+                let mut heap_memory = AlignedMemory::<{solana_sbpf::ebpf::HOST_ALIGN}>::zero_filled(heap_size);
+                println!("heap {} {}", solana_sbpf::ebpf::MM_HEAP_START, solana_sbpf::ebpf::MM_HEAP_START + heap_size as u64);
                 address_space.regions.push(MemoryRegion::new_writable(heap_memory.as_slice_mut(), solana_sbpf::ebpf::MM_HEAP_START));
                 address_space.mem.push(heap_memory);
-                //address_space.heap = MemoryRegion::new_writable(&mut [], solana_sbpf::ebpf::MM_HEAP_START);
-                //address_space.heap.len = heap_size;
-                //address_space.heap.vm_addr_end = solana_sbpf::ebpf::MM_HEAP_START.saturating_add(heap_size);
 
                 // stack memory
-                let mut stack_memory = AlignedMemory::<{solana_sbpf::ebpf::HOST_ALIGN}>::with_capacity_zeroed(stack_size);
+                println!("stack configuration {} {} ", executable.get_config().stack_size(), executable.get_config().stack_frame_size);
+                let mut stack_memory = AlignedMemory::<{solana_sbpf::ebpf::HOST_ALIGN}>::zero_filled(stack_size);
                 address_space.regions.push(
                     MemoryRegion::new_writable_gapped(
                         stack_memory.as_slice_mut(),
                         solana_sbpf::ebpf::MM_STACK_START,
                         if !executable.get_sbpf_version().dynamic_stack_frames() && executable.get_config().enable_stack_frame_gaps {
-                            stack_size as u64
+                            executable.get_config().stack_frame_size as u64
                         } else {
                             0
                         },
                     )
                 );
+                debug_display_region("stack", address_space.regions.last().unwrap());
                 address_space.mem.push(stack_memory);
-                //address_space.stack = MemoryRegion::new_writable_gapped(
-                //    &mut [],
-                //    solana_sbpf::ebpf::MM_STACK_START,
-                //    if !executable.get_sbpf_version().dynamic_stack_frames() && executable.get_config().enable_stack_frame_gaps {
-                //        stack_size
-                //    } else {
-                //        0
-                //    },
-                //);
-                //address_space.stack.len = stack_size;
-                //address_space.stack.vm_addr_end = solana_sbpf::ebpf::MM_STACK_START.saturating_add(stack_size);
 
                 self.conf.push(InstructionConf{ move_memory_instruction_classes: executable.get_sbpf_version().move_memory_instruction_classes() });
             },
@@ -518,7 +580,7 @@ impl InstructionTrace {
         let (serialized, regions, accounts_metadata) = serialize_parameters(ctx, &ictx, true, mask_out_rent_epoch_in_vm_serialization)?;
         
         address_space.mem.push(serialized);
-        address_space.regions = regions;
+        address_space.regions.extend(regions.into_iter());
         address_space.accounts = accounts_metadata;
 
         TRACE_IN_PROGRESS.with(|addr| addr.replace(self as *mut Self));
@@ -526,25 +588,57 @@ impl InstructionTrace {
         Ok(())
     }
 
-    fn add_execution_trace(&mut self, ctx: &InvokeContext) {
+    fn replay_syscall(&mut self, address_space: &mut AddressSpace, op: &SysCall) -> Result<(), EmulationError> {
+        match op {
+            SysCall::MemCpy { dst, src, n} => {
+                let cost = self.compute_budget.to_cost();
+                self.consume_cu(cost.mem_op_base_cost.max(
+                    n.checked_div(cost.cpi_bytes_per_unit)
+                        .unwrap_or(u64::MAX)));
+
+                for i in 0..*n {
+                    let srcaddr = address_space.translate_vmaddr(src + i, 1, Some(true)).ok_or(EmulationError::AddressTranslationError { vmaddr: src + i })?;
+                    let dstaddr = address_space.translate_vmaddr(dst + i, 1, Some(true)).ok_or(EmulationError::AddressTranslationError { vmaddr: dst + i })?;
+                    mstore(dstaddr, mload::<u8>(srcaddr));
+                }
+            },
+            SysCall::Unknown => println!("undefined syscall")
+        }
+        
+        Ok(())
+    }
+
+    fn add_execution_trace(&mut self, ctx: &InvokeContext) -> Result<(), EmulationError> {
         let frame_number = self.pop_frame();
         let trace = ctx.get_traces().last().unwrap();
         self.entries[frame_number] = trace.iter().map(
             |regs| TraceEntry::new(regs, &self.address_space[frame_number]))
                 .collect::<Vec<TraceEntry>>();
-        let slice = &mut self.entries[frame_number];
         let mut address_space = self.address_space[frame_number].clone();
-        for i in 0..slice.len() {
+        for i in 0..self.entries[frame_number].len() {
+            self.consume_cu(1);
             {
-                let slice = &mut slice[i..i+2];
+                let slice = &mut self.entries[frame_number][i..];
                 let (fs, sc) = slice.split_at_mut(1);
                 if !sc.is_empty() && !fs.is_empty() {
-                    fs[0].fill_memory_access(&sc[0], &address_space, self.conf[frame_number].move_memory_instruction_classes);
+                    fs[0].regs_after = sc[0].regs_before;
                 }
             }
-            if let Some(op@MemoryAccess::Write {..}) = &slice[i].mem {
-                address_space.replay(op.clone())
+
+            let cur = &mut self.entries[frame_number][i];
+            cur.cu_meter = self.cu_meter;
+            cur.fill_memory_access(&address_space, self.conf[frame_number].move_memory_instruction_classes).unwrap();
+            cur.fill_syscall(&self.registered_syscalls);
+
+            let cur = cur.clone();
+            if let Some(op@MemoryAccess::Write {..}) = &cur.mem {
+                address_space.replay(op.clone())?;
+            }
+            if let Some(ref syscall) = &cur.syscall {
+                self.replay_syscall(&mut address_space, syscall)?;
             }
         }
+
+        Ok(())
     }
 }

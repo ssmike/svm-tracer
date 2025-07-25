@@ -5,7 +5,7 @@ use {
     }, solana_sdk::{
         account::Account, bpf_loader_upgradeable, instruction::{AccountMeta, Instruction}, pubkey::Pubkey
     },
-    svm_tracer::{InstructionTrace, InstructionTraceBuilder}
+    svm_tracer::{debug_display_region, InstructionTrace, InstructionTraceBuilder}
 };
 
 
@@ -30,6 +30,25 @@ fn instruction_burn_cus(program_id: &Pubkey, to_burn: u64) -> Instruction {
     Instruction::new_with_bytes(*program_id, &to_burn.to_le_bytes(), vec![])
 }
 
+declare_builtin_function!(
+    /// A custom syscall to burn CUs.
+    SyscallInspect,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        to_burn: u64,
+        _arg2: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        for r in memory_mapping.get_regions() {
+            debug_display_region("inspect region", r);
+        }
+        Ok(0)
+    }
+);
+
 fn main() {
     let program_id = Pubkey::new_unique();
     let key1 = Pubkey::new_unique();
@@ -49,16 +68,11 @@ fn main() {
         (key2, Account::default()),
     ];
 
-    //let mut mollusk = Mollusk::default();
-
     let mut mollusk = Mollusk::default();
-    //mollusk.program_cache = ProgramCache::new_with_tracing(
-    //    &mollusk.feature_set,
-    //    &mollusk.compute_budget);
-
     mollusk
         .program_cache.program_runtime_environment
-        .register_function("sol_burn_cus", SyscallBurnCus::vm)
+        //.register_function("sol_burn_cus", SyscallBurnCus::vm)
+        .register_function("sol_inspect", SyscallInspect::vm)
         .unwrap();
 
     let _ = InstructionTraceBuilder::prepare_for_tracing(&mut mollusk);
@@ -74,6 +88,7 @@ fn main() {
     // Execute the instruction and get the result.
     let trace = InstructionTraceBuilder::build(&mut mollusk, &instruction, &accounts);
 
+    println!("cu meters {} {} difference {}", trace.cu_meter, trace.cu_initial_value, trace.cu_initial_value - trace.cu_meter);
     let result = trace.result;
     println!("Hello, mollusk! \n{result:?}");
 
@@ -81,7 +96,7 @@ fn main() {
         println!("frame");
         for entry in trace {
             let mem = entry.mem;
-            println!("{mem:?}")
+            //println!("{mem:?}")
         }
     }
 }
