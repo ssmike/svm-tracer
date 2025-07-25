@@ -3,11 +3,11 @@ use std::{alloc::alloc_zeroed, collections::BTreeMap, error::Error, mem};
 use {
     agave_feature_set::FeatureSet,
     mollusk_svm_error::error::{MolluskError, MolluskPanic},
-    mollusk_svm::{Mollusk, result::InstructionResult},
+    mollusk_svm::{Mollusk, result::InstructionResult, InvocationInspectCallback},
     solana_account::Account,
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_instruction::{AccountMeta, Instruction, error::InstructionError},
-    solana_program_runtime::{invoke_context::{InvokeContext, SerializedAccountMetadata},
+    solana_program_runtime::{solana_sbpf::{aligned_memory::{AlignedMemory, Pod}, program::BuiltinProgram}, invoke_context::{InvokeContext, SerializedAccountMetadata},
     loaded_programs::ProgramCacheEntryOwner, serialization::serialize_parameters, solana_sbpf::{self, declare_builtin_function, memory_region::{MemoryMapping, MemoryRegion}}},
     solana_pubkey::Pubkey,
     solana_transaction_context::{InstructionAccount, InstructionContext},
@@ -16,14 +16,12 @@ use {
 };
 
 mod syscall_decode;
-use mollusk_svm::InvocationInspectCallback;
 use solana_bpf_loader_program::calculate_heap_cost;
-use solana_program_runtime::solana_sbpf::{aligned_memory::{AlignedMemory, Pod}, program::BuiltinProgram};
 use solana_transaction_context::IndexOfAccount;
 use syscall_decode::{translate_signers_c, translate_instruction_c, translate_signers_rust, translate_instruction_rust};
 
 #[derive(Debug)]
-enum EmulationError {
+pub enum EmulationError {
     AddressTranslationError{vmaddr: u64},
     MemoryConsistencyCheck{vmaddr: u64, value: u64},
     InstructionError(InstructionError),
@@ -50,6 +48,91 @@ pub struct AddressSpace {
 
     pub text_vmaddr: u64,
     pub text: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MemoryAccess {
+    Read{
+        size: u8,
+        vmaddr: u64,
+        value: u64,
+    },
+    Write{
+        size: u8,
+        vmaddr: u64,
+        before: u64,
+        value: u64
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum CPIKind {
+    C, Rust
+}
+
+#[derive(Debug, Clone)]
+pub struct CPIEntry {
+    pub program: Pubkey,
+    pub instruction_data: Vec<u8>,
+    pub instruction_accounts: Vec<InstructionAccount>,
+    pub kind: CPIKind,
+
+    pub callee_frame: usize,
+    pub caller_frame: usize,
+
+    pub cu_meter_before: u64,
+    pub cu_meter_after: u64
+}
+
+#[derive(Debug, Clone)]
+pub enum SysCall {
+    MemCpy{dst: u64, src: u64, n: u64},
+    CPI{ entry_num: usize },
+    Unknown
+}
+
+#[derive(Debug, Clone)]
+pub struct TraceEntry {
+    pub regs_after: [u64; 12],
+    pub regs_before: [u64; 12],
+    pub insn: solana_sbpf::ebpf::Insn,
+
+    pub mem: Option<MemoryAccess>,
+    pub syscall: Option<SysCall>,
+
+    pub cu_meter_before: u64,
+    // after execution
+    pub cu_meter: u64
+}
+
+#[derive(Debug, Default)]
+pub struct InstructionConf {
+    move_memory_instruction_classes: bool
+}
+
+#[derive(Debug)]
+pub struct InstructionTrace {
+    pub entries: Vec<Vec<TraceEntry>>,
+    pub address_space: Vec<AddressSpace>,
+    pub result: InstructionResult,
+    pub conf: Vec<InstructionConf>,
+
+    feature_set: FeatureSet,
+    compute_budget: ComputeBudget,
+
+    registered_syscalls: BTreeMap<u32, String>,
+
+    pub cu_meter: u64,
+    pub cu_initial_value: u64,
+
+    pub cpi_calls: Vec<CPIEntry>,
+
+    cpi_caller: Vec<usize>,
+    cur_frame: usize,
+}
+
+pub struct InstructionTraceBuilder {
+    trace: Rc<RefCell<Option<InstructionTrace>>>
 }
 
 #[inline]
@@ -133,59 +216,6 @@ impl Clone for AddressSpace {
             text_vmaddr: self.text_vmaddr
         }
     }
-}
-
-
-#[derive(Debug, Clone)]
-pub enum MemoryAccess {
-    Read{
-        size: u8,
-        vmaddr: u64,
-        value: u64,
-    },
-    Write{
-        size: u8,
-        vmaddr: u64,
-        before: u64,
-        value: u64
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum CPIKind {
-    C, Rust
-}
-
-#[derive(Debug, Clone)]
-pub struct CPIEntry {
-    pub program: Pubkey,
-    pub instruction_data: Vec<u8>,
-    pub instruction_accounts: Vec<InstructionAccount>,
-    pub kind: CPIKind,
-
-    pub callee_frame: usize,
-    pub caller_frame: usize
-}
-
-#[derive(Debug, Clone)]
-pub enum SysCall {
-    MemCpy{dst: u64, src: u64, n: u64},
-    CPI{ entry_num: usize },
-    Unknown
-}
-
-#[derive(Debug, Clone)]
-pub struct TraceEntry {
-    pub regs_after: [u64; 12],
-    pub regs_before: [u64; 12],
-    pub insn: solana_sbpf::ebpf::Insn,
-
-    pub mem: Option<MemoryAccess>,
-    pub syscall: Option<SysCall>,
-
-    pub cu_meter_before: u64,
-    // after execution
-    pub cu_meter: u64
 }
 
 impl TraceEntry {
@@ -311,35 +341,6 @@ impl TraceEntry {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct InstructionConf {
-    move_memory_instruction_classes: bool
-}
-
-#[derive(Debug)]
-pub struct InstructionTrace {
-    pub entries: Vec<Vec<TraceEntry>>,
-    pub address_space: Vec<AddressSpace>,
-    pub result: InstructionResult,
-    pub conf: Vec<InstructionConf>,
-
-    frame_number: Vec<usize>,
-
-    feature_set: FeatureSet,
-    compute_budget: ComputeBudget,
-
-    registered_syscalls: BTreeMap<u32, String>,
-
-    pub cu_meter: u64,
-    pub cu_initial_value: u64,
-
-    pub cpi_calls: Vec<CPIEntry>,
-}
-
-pub struct InstructionTraceBuilder {
-    trace: Rc<RefCell<Option<InstructionTrace>>>
-}
-
 impl InstructionTraceBuilder {
     // prepares programs environment for tracing and returns an old env
     pub fn prepare_for_tracing(mollusk: &mut Mollusk) -> BuiltinProgram<InvokeContext<'static>> {
@@ -404,7 +405,7 @@ impl mollusk_svm::InvocationInspectCallback for InstructionTraceBuilder {
     }
 
     fn after_invocation(&self, invoke_context: &InvokeContext) {
-        self.trace.borrow_mut().as_mut().unwrap().add_execution_trace(invoke_context);
+        self.trace.borrow_mut().as_mut().unwrap().finalize_frame(invoke_context).expect("root call tracing failed");
     }
 }
 
@@ -412,7 +413,7 @@ thread_local! {
     static TRACE_IN_PROGRESS: RefCell<*mut InstructionTrace> = RefCell::new(std::ptr::null_mut());
 }
 
-macro_rules! instr_syscall_stub {
+macro_rules! instr_invoke_syscall_stub {
     ($name:ident, $syscall:ident, $translate_instruction:ident, $translate_signers:ident, $kind:expr) => {
         declare_builtin_function!(
             $name,
@@ -441,22 +442,21 @@ macro_rules! instr_syscall_stub {
                 let (instruction_accounts, _) =
                     invoke_context.prepare_instruction(&instruction, &signers)?;
 
-                let entry = CPIEntry {
-                    kind: $kind,
-                    program: instruction.program_id,
-                    instruction_data: instruction.data.to_vec(),
-                    instruction_accounts: instruction_accounts.clone(),
-                    caller_frame: 0,
-                    callee_frame: 0
-                };
-                let mut frame_number: usize = 0;
                 let mut cpi_number: usize = 0;
-
-                TRACE_IN_PROGRESS.with_borrow_mut(|trace| {
+                let frame_number = TRACE_IN_PROGRESS.with_borrow_mut(|trace| {
                     let trace: &mut InstructionTrace = unsafe{&mut (**trace)};
                     cpi_number = trace.cpi_calls.len();
-                    trace.cpi_calls.push(entry);
-                    frame_number = trace.next_frame_number();
+                    trace.cpi_calls.push(
+                        CPIEntry {
+                            kind: $kind,
+                            program: instruction.program_id,
+                            instruction_data: instruction.data.to_vec(),
+                            instruction_accounts: instruction_accounts.clone(),
+                            caller_frame: trace.cur_frame,
+                            callee_frame: 0,
+                            cu_meter_before: trace.cu_meter,
+                            cu_meter_after: 0
+                        });
 
                     trace.prepare(
                         &instruction.program_id,
@@ -476,7 +476,10 @@ macro_rules! instr_syscall_stub {
 
                 TRACE_IN_PROGRESS.with_borrow_mut(|trace| {
                     let trace: &mut InstructionTrace = unsafe{&mut (**trace)};
-                    trace.add_execution_trace(invoke_context)
+                    trace.cpi_calls[cpi_number].callee_frame = frame_number;
+                    let result = trace.finalize_frame(invoke_context);
+                    trace.cpi_calls[cpi_number].cu_meter_after = trace.cu_meter;
+                    result
                 })?;
 
                 result
@@ -486,8 +489,8 @@ macro_rules! instr_syscall_stub {
     };
 }
 
-instr_syscall_stub!(SyscallInvokeSignedCStub, SyscallInvokeSignedC, translate_instruction_c, translate_signers_c, CPIKind::C);
-instr_syscall_stub!(SyscallInvokeSignedRustStub, SyscallInvokeSignedRust, translate_instruction_rust, translate_signers_rust, CPIKind::Rust);
+instr_invoke_syscall_stub!(SyscallInvokeSignedCStub, SyscallInvokeSignedC, translate_instruction_c, translate_signers_c, CPIKind::C);
+instr_invoke_syscall_stub!(SyscallInvokeSignedRustStub, SyscallInvokeSignedRust, translate_instruction_rust, translate_signers_rust, CPIKind::Rust);
 
 impl Default for InstructionTrace {
     fn default() -> Self {
@@ -496,13 +499,14 @@ impl Default for InstructionTrace {
             result: InstructionResult::default(),
             address_space: vec![],
             conf: vec![],
-            frame_number: vec![],
             feature_set: FeatureSet::default(),
             compute_budget: ComputeBudget::default(),
             registered_syscalls: BTreeMap::new(),
             cu_meter: 0,
             cu_initial_value: 0,
-            cpi_calls: vec![]
+            cpi_calls: vec![],
+            cur_frame: 0,
+            cpi_caller: vec![]
         }
     }
 }
@@ -526,7 +530,6 @@ impl InstructionTrace {
             self
                 .registered_syscalls
                 .insert(key, String::from_utf8(name.to_vec()).unwrap());
-            println!("syscall {key} {}", String::from_utf8(name.to_vec()).unwrap());
         }
 
         self.feature_set = mollusk.feature_set.clone();
@@ -535,27 +538,26 @@ impl InstructionTrace {
         self.cu_initial_value = self.compute_budget.compute_unit_limit;
     }
 
-    fn next_frame_number(&self) -> usize {
-        self.address_space.len()
-    }
-
     fn push_frame(&mut self) {
-        let frame_number = self.address_space.len();
-        self.entries.push(vec![]);
-        self.frame_number.push(frame_number);
+        let caller = self.cur_frame;
+        let calee = self.address_space.len();
 
+        self.entries.push(vec![]);
         self.address_space.push(AddressSpace::default());
+
+        self.cpi_caller.push(caller);
+        self.cur_frame = calee;
     }
 
-    fn pop_frame(&mut self) -> usize {
-        self.frame_number.pop().unwrap()
+    fn pop_frame(&mut self) {
+        self.cur_frame = self.cpi_caller.pop().unwrap();
     }
  
     fn prepare(&mut self,
         program_id: &Pubkey,
         instruction_data: &[u8],
         instruction_accounts: &[InstructionAccount],
-        invoke_context: &InvokeContext) -> Result<(), InstructionError>
+        invoke_context: &InvokeContext) -> Result<usize, InstructionError>
     {
         let program_indices = vec![invoke_context.transaction_context.find_index_of_account(program_id).unwrap()];
 
@@ -639,7 +641,7 @@ impl InstructionTrace {
 
         TRACE_IN_PROGRESS.with(|addr| addr.replace(self as *mut Self));
 
-        Ok(())
+        Ok(self.cur_frame)
     }
 
     fn replay_syscall(&mut self, address_space: &mut AddressSpace, op: &SysCall) -> Result<(), EmulationError> {
@@ -664,8 +666,10 @@ impl InstructionTrace {
         Ok(())
     }
 
-    fn add_execution_trace(&mut self, ctx: &InvokeContext) -> Result<(), EmulationError> {
-        let frame_number = self.pop_frame();
+    fn finalize_frame(&mut self, ctx: &InvokeContext) -> Result<(), EmulationError> {
+        let frame_number = self.cur_frame;
+        self.pop_frame();
+
         let trace = ctx.get_traces().last().unwrap();
         self.entries[frame_number] = trace.iter().map(
             |regs| TraceEntry::new(regs, &self.address_space[frame_number]))
