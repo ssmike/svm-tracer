@@ -19,13 +19,26 @@ mod syscall_decode;
 use mollusk_svm::InvocationInspectCallback;
 use solana_bpf_loader_program::calculate_heap_cost;
 use solana_program_runtime::solana_sbpf::{aligned_memory::{AlignedMemory, Pod}, program::BuiltinProgram};
+use solana_transaction_context::IndexOfAccount;
 use syscall_decode::{translate_signers_c, translate_instruction_c, translate_signers_rust, translate_instruction_rust};
 
 #[derive(Debug)]
 enum EmulationError {
     AddressTranslationError{vmaddr: u64},
-    MemoryConsistencyCheck{vmaddr: u64, value: u64, cu_meter: u64},
+    MemoryConsistencyCheck{vmaddr: u64, value: u64},
     InstructionError(InstructionError),
+}
+
+impl std::error::Error for EmulationError { }
+
+impl std::fmt::Display for EmulationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddressTranslationError { vmaddr } => write!(f, "address translation {vmaddr} failed"),
+            Self::MemoryConsistencyCheck { vmaddr, value } => write!(f, "memory load consistency check {vmaddr} with value {value}"),
+            Self::InstructionError(err) => std::fmt::Display::fmt(&err, f)
+        }
+    }
 }
 
 // Initial memory layout for an instruction without stack and heap.
@@ -139,8 +152,25 @@ pub enum MemoryAccess {
 }
 
 #[derive(Debug, Clone)]
+pub enum CPIKind {
+    C, Rust
+}
+
+#[derive(Debug, Clone)]
+pub struct CPIEntry {
+    pub program: Pubkey,
+    pub instruction_data: Vec<u8>,
+    pub instruction_accounts: Vec<InstructionAccount>,
+    pub kind: CPIKind,
+
+    pub callee_frame: usize,
+    pub caller_frame: usize
+}
+
+#[derive(Debug, Clone)]
 pub enum SysCall {
     MemCpy{dst: u64, src: u64, n: u64},
+    CPI{ entry_num: usize },
     Unknown
 }
 
@@ -153,6 +183,7 @@ pub struct TraceEntry {
     pub mem: Option<MemoryAccess>,
     pub syscall: Option<SysCall>,
 
+    pub cu_meter_before: u64,
     // after execution
     pub cu_meter: u64
 }
@@ -274,7 +305,8 @@ impl TraceEntry {
             insn,
             mem: None,
             syscall: None,
-            cu_meter: 0
+            cu_meter: 0,
+            cu_meter_before: 0
         }
     }
 }
@@ -299,7 +331,9 @@ pub struct InstructionTrace {
     registered_syscalls: BTreeMap<u32, String>,
 
     pub cu_meter: u64,
-    pub cu_initial_value: u64
+    pub cu_initial_value: u64,
+
+    pub cpi_calls: Vec<CPIEntry>,
 }
 
 pub struct InstructionTraceBuilder {
@@ -379,7 +413,7 @@ thread_local! {
 }
 
 macro_rules! instr_syscall_stub {
-    ($name:ident, $syscall:ident, $translate_instruction:ident, $translate_signers:ident) => {
+    ($name:ident, $syscall:ident, $translate_instruction:ident, $translate_signers:ident, $kind:expr) => {
         declare_builtin_function!(
             $name,
             fn rust(
@@ -407,8 +441,23 @@ macro_rules! instr_syscall_stub {
                 let (instruction_accounts, _) =
                     invoke_context.prepare_instruction(&instruction, &signers)?;
 
+                let entry = CPIEntry {
+                    kind: $kind,
+                    program: instruction.program_id,
+                    instruction_data: instruction.data.to_vec(),
+                    instruction_accounts: instruction_accounts.clone(),
+                    caller_frame: 0,
+                    callee_frame: 0
+                };
+                let mut frame_number: usize = 0;
+                let mut cpi_number: usize = 0;
+
                 TRACE_IN_PROGRESS.with_borrow_mut(|trace| {
                     let trace: &mut InstructionTrace = unsafe{&mut (**trace)};
+                    cpi_number = trace.cpi_calls.len();
+                    trace.cpi_calls.push(entry);
+                    frame_number = trace.next_frame_number();
+
                     trace.prepare(
                         &instruction.program_id,
                         instruction.data.as_ref(),
@@ -427,8 +476,8 @@ macro_rules! instr_syscall_stub {
 
                 TRACE_IN_PROGRESS.with_borrow_mut(|trace| {
                     let trace: &mut InstructionTrace = unsafe{&mut (**trace)};
-                    trace.add_execution_trace(invoke_context);
-                });
+                    trace.add_execution_trace(invoke_context)
+                })?;
 
                 result
             }
@@ -437,8 +486,8 @@ macro_rules! instr_syscall_stub {
     };
 }
 
-instr_syscall_stub!(SyscallInvokeSignedCStub, SyscallInvokeSignedC, translate_instruction_c, translate_signers_c);
-instr_syscall_stub!(SyscallInvokeSignedRustStub, SyscallInvokeSignedRust, translate_instruction_rust, translate_signers_rust);
+instr_syscall_stub!(SyscallInvokeSignedCStub, SyscallInvokeSignedC, translate_instruction_c, translate_signers_c, CPIKind::C);
+instr_syscall_stub!(SyscallInvokeSignedRustStub, SyscallInvokeSignedRust, translate_instruction_rust, translate_signers_rust, CPIKind::Rust);
 
 impl Default for InstructionTrace {
     fn default() -> Self {
@@ -453,6 +502,7 @@ impl Default for InstructionTrace {
             registered_syscalls: BTreeMap::new(),
             cu_meter: 0,
             cu_initial_value: 0,
+            cpi_calls: vec![]
         }
     }
 }
@@ -483,6 +533,10 @@ impl InstructionTrace {
         self.compute_budget = mollusk.compute_budget.clone();
         self.cu_meter = self.compute_budget.compute_unit_limit;
         self.cu_initial_value = self.compute_budget.compute_unit_limit;
+    }
+
+    fn next_frame_number(&self) -> usize {
+        self.address_space.len()
     }
 
     fn push_frame(&mut self) {
@@ -602,6 +656,8 @@ impl InstructionTrace {
                     mstore(dstaddr, mload::<u8>(srcaddr));
                 }
             },
+            SysCall::CPI { entry_num } => {
+            },
             SysCall::Unknown => println!("undefined syscall")
         }
         
@@ -616,6 +672,7 @@ impl InstructionTrace {
                 .collect::<Vec<TraceEntry>>();
         let mut address_space = self.address_space[frame_number].clone();
         for i in 0..self.entries[frame_number].len() {
+            let cu_before = self.cu_meter;
             self.consume_cu(1);
             {
                 let slice = &mut self.entries[frame_number][i..];
@@ -626,6 +683,7 @@ impl InstructionTrace {
             }
 
             let cur = &mut self.entries[frame_number][i];
+            cur.cu_meter_before = cu_before;
             cur.cu_meter = self.cu_meter;
             cur.fill_memory_access(&address_space, self.conf[frame_number].move_memory_instruction_classes).unwrap();
             cur.fill_syscall(&self.registered_syscalls);
