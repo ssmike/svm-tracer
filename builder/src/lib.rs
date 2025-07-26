@@ -1,4 +1,4 @@
-use std::{alloc::alloc_zeroed, collections::BTreeMap, error::Error, mem};
+use std::{alloc::alloc_zeroed, cell::Cell, collections::BTreeMap, error::Error, mem};
 
 use {
     agave_feature_set::FeatureSet,
@@ -10,14 +10,12 @@ use {
     solana_program_runtime::{solana_sbpf::{aligned_memory::{AlignedMemory, Pod}, program::BuiltinProgram}, invoke_context::{InvokeContext, SerializedAccountMetadata},
     loaded_programs::ProgramCacheEntryOwner, serialization::serialize_parameters, solana_sbpf::{self, declare_builtin_function, memory_region::{MemoryMapping, MemoryRegion}}},
     solana_pubkey::Pubkey,
-    solana_transaction_context::{InstructionAccount, InstructionContext},
-    solana_bpf_loader_program::syscalls::{SyscallInvokeSignedC, SyscallInvokeSignedRust},
-    std::{cell::RefCell, rc::Rc},
+    solana_transaction_context::{InstructionAccount, InstructionContext, IndexOfAccount},
+    solana_bpf_loader_program::{calculate_heap_cost, syscalls::{SyscallInvokeSignedC, SyscallInvokeSignedRust}},
+    std::{cell::RefCell, rc::Rc, borrow::Borrow},
 };
 
 mod syscall_decode;
-use solana_bpf_loader_program::calculate_heap_cost;
-use solana_transaction_context::IndexOfAccount;
 use syscall_decode::{translate_signers_c, translate_instruction_c, translate_signers_rust, translate_instruction_rust};
 
 #[derive(Debug)]
@@ -75,6 +73,7 @@ pub struct CPIEntry {
     pub program: Pubkey,
     pub instruction_data: Vec<u8>,
     pub instruction_accounts: Vec<InstructionAccount>,
+    pub return_data: Vec<u8>,
     pub kind: CPIKind,
 
     pub callee_frame: usize,
@@ -129,10 +128,16 @@ pub struct InstructionTrace {
 
     cpi_caller: Vec<usize>,
     cur_frame: usize,
+    tx_context_keys: Vec<Pubkey>,
+
+    pub return_data: BTreeMap<Pubkey, Vec<u8>>,
+    pub instructions: Vec<Instruction>
 }
 
+#[derive(Clone)]
 pub struct InstructionTraceBuilder {
-    trace: Rc<RefCell<Option<InstructionTrace>>>
+    trace: Rc<RefCell<Option<InstructionTrace>>>,
+    err: Rc<RefCell<Option<EmulationError>>>
 }
 
 #[inline]
@@ -375,21 +380,26 @@ impl InstructionTraceBuilder {
         old_env
     }
 
-    pub fn build(mollusk: &mut Mollusk, instruction: &Instruction, accounts: &[(Pubkey, Account)]) -> InstructionTrace {
+    pub fn build(mollusk: &mut Mollusk, instruction: &Instruction, accounts: &[(Pubkey, Account)]) -> Result<InstructionTrace, EmulationError> {
         let this = Self {
-            trace: RefCell::new(Some(InstructionTrace::default())).into()
+            trace: RefCell::new(Some(InstructionTrace::default())).into(),
+            err: RefCell::new(None).into(),
         };
-        let trace = this.trace.clone();
         this.trace.borrow_mut().as_mut().unwrap().configure(mollusk);
 
-        let mut cb: Box<dyn InvocationInspectCallback> = Box::new(this);
-
+        let mut cb: Box<dyn InvocationInspectCallback> = Box::new(this.clone());
         mem::swap(&mut cb, &mut mollusk.invocation_inspect_callback);
+        TRACE_IN_PROGRESS.with(|addr| addr.replace(std::ptr::null_mut()));
         let result = mollusk.process_instruction(instruction, accounts);
-        trace.borrow_mut().as_mut().unwrap().result.absorb(result);
 
-        let result = trace.borrow_mut().take().unwrap();
-        result
+        if let Some(err) = RefCell::borrow_mut(&this.err).take() {
+            return Err(err)
+        }
+
+        this.trace.borrow_mut().as_mut().unwrap().result.absorb(result);
+
+        let result = this.trace.borrow_mut().take().unwrap();
+        Ok(result)
     }
 }
 
@@ -401,11 +411,19 @@ impl mollusk_svm::InvocationInspectCallback for InstructionTraceBuilder {
             instruction_accounts: &[InstructionAccount],
             invoke_context: &InvokeContext,
         ) {
-        self.trace.borrow_mut().as_mut().unwrap().prepare(program_id, instruction_data, instruction_accounts, invoke_context).unwrap();
+        match self.trace.borrow_mut().as_mut().unwrap().prepare(program_id, instruction_data, instruction_accounts, invoke_context) {
+            Err(err) => { self.err.replace(Some(EmulationError::InstructionError(err))); },
+            _ => {}
+        };
     }
 
     fn after_invocation(&self, invoke_context: &InvokeContext) {
-        self.trace.borrow_mut().as_mut().unwrap().finalize_frame(invoke_context).expect("root call tracing failed");
+        if RefCell::borrow(&self.err).borrow().is_none() {
+           match self.trace.borrow_mut().as_mut().unwrap().finalize_frame(invoke_context) {
+            Err(err) => { self.err.replace(Some(err)); },
+            _ => {}
+           }
+        }
     }
 }
 
@@ -442,6 +460,17 @@ macro_rules! instr_invoke_syscall_stub {
                 let (instruction_accounts, _) =
                     invoke_context.prepare_instruction(&instruction, &signers)?;
 
+                if TRACE_IN_PROGRESS.with_borrow(|trace| *trace.borrow()).is_null() {
+                    return $syscall::rust(
+                        invoke_context,
+                        instruction_addr,
+                        account_infos_addr,
+                        account_infos_len,
+                        signers_seeds_addr,
+                        signers_seeds_len,
+                        memory_mapping);
+                }
+
                 let mut cpi_number: usize = 0;
                 let frame_number = TRACE_IN_PROGRESS.with_borrow_mut(|trace| {
                     let trace: &mut InstructionTrace = unsafe{&mut (**trace)};
@@ -455,7 +484,8 @@ macro_rules! instr_invoke_syscall_stub {
                             caller_frame: trace.cur_frame,
                             callee_frame: 0,
                             cu_meter_before: trace.cu_meter,
-                            cu_meter_after: 0
+                            cu_meter_after: 0,
+                            return_data: vec![]
                         });
 
                     trace.prepare(
@@ -506,7 +536,10 @@ impl Default for InstructionTrace {
             cu_initial_value: 0,
             cpi_calls: vec![],
             cur_frame: 0,
-            cpi_caller: vec![]
+            cpi_caller: vec![],
+            tx_context_keys: vec![],
+            instructions: vec![],
+            return_data: BTreeMap::new()
         }
     }
 }
@@ -574,12 +607,31 @@ impl InstructionTrace {
             _ => return Err(InstructionError::UnsupportedProgramId)
         }
 
+        if self.tx_context_keys.is_empty() {
+            let tx_context = &invoke_context.transaction_context;
+            for i in 0..tx_context.get_number_of_accounts() {
+                self.tx_context_keys.push(*tx_context.get_key_of_account_at_index(i as u16)?);
+            }
+        }
+
         let runtime_features = self.feature_set.runtime_features();
         let heap_size = self.compute_budget.heap_size as usize;
         self.consume_cu(calculate_heap_cost(heap_size as u32, self.compute_budget.to_cost().heap_cost));
 
         self.push_frame();
         let address_space = self.address_space.last_mut().unwrap();
+        self.instructions.push(Instruction {
+            program_id: *program_id,
+            data: instruction_data.to_vec(),
+            accounts: instruction_accounts
+                .iter()
+                .map(|acc|
+                    AccountMeta {
+                        pubkey: self.tx_context_keys[acc.index_in_transaction as usize],
+                        is_writable: acc.is_writable,
+                        is_signer: acc.is_signer
+                    }).collect()
+            });
 
         match cache_entry_type  {
             solana_program_runtime::loaded_programs::ProgramCacheEntryType::Loaded(executable) => {

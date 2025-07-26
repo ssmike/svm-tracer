@@ -86,7 +86,7 @@ fn main() {
     mollusk.add_program(&program_id, "sample", &bpf_loader_upgradeable::id());
 
     // Execute the instruction and get the result.
-    let trace = InstructionTraceBuilder::build(&mut mollusk, &instruction, &accounts);
+    let trace = InstructionTraceBuilder::build(&mut mollusk, &instruction, &accounts).expect("trace build error");
 
     println!("cu meters {} {} difference {}", trace.cu_meter, trace.cu_initial_value, trace.cu_initial_value - trace.cu_meter);
     let result = trace.result;
