@@ -86,6 +86,7 @@ pub struct CPIEntry {
 #[derive(Debug, Clone)]
 pub enum SysCall {
     MemCpy{dst: u64, src: u64, n: u64},
+    MemCmp{s1: u64, s2: u64, n: u64, result: u64},
     CPI{ entry_num: usize },
     Unknown
 }
@@ -146,28 +147,29 @@ fn mload<T: Pod + Into<u64>>(phy_addr: u64) -> u64 {
 }
 
 #[inline]
-fn mstore<T: Pod + Into<u64>>(phy_addr: u64, value: T) {
+fn mstore<T: Pod>(phy_addr: u64, value: T) {
     unsafe { std::ptr::write_unaligned::<T>(phy_addr as *mut T, value) }.into()
 }
 
 impl AddressSpace {
-    fn translate_vmaddr(&self, addr: u64, len: u64, load: Option<bool>) -> Option<u64> {
-        for r in self.regions.as_slice().iter() {
+    fn translate_vmaddr(&self, addr: u64, len: u64, load: Option<bool>) -> Result<u64, EmulationError> {
+        for r in self.regions.as_slice().iter().rev() {
             if let Some(addr) = r.vm_to_host(addr, len) {
                 return match load {
-                    Some(true) => Some(addr),
-                    None => Some(addr),
-                    Some(false) => { if !r.writable.get() { None } else { Some(addr) } }
+                    Some(true) => Ok(addr),
+                    None => Ok(addr),
+                    Some(false) => { if !r.writable.get() { Err(EmulationError::AddressTranslationError { vmaddr: addr }) } else { Ok(addr) } }
                 };
             }
         }
-        None
+
+        Err(EmulationError::AddressTranslationError { vmaddr: addr })
     }
 
     pub fn replay(&mut self, op: MemoryAccess) -> Result<(), EmulationError> {
         match op {
             MemoryAccess::Write{value, vmaddr, size, ..} => {
-                let phy_addr = self.translate_vmaddr(vmaddr, size as u64, Some(false)).ok_or(EmulationError::AddressTranslationError { vmaddr })?;
+                let phy_addr = self.translate_vmaddr(vmaddr, size as u64, Some(false))?;
                 match size {
                     1 => mstore(phy_addr, value as u8),
                     2 => mstore(phy_addr, value as u16),
@@ -236,7 +238,8 @@ impl TraceEntry {
         if let Some(selected_call) = selected_call { 
             self.syscall = match selected_call {
                 "sol_memcpy_" => Some(SysCall::MemCpy { src: args[1], dst: args[0], n: args[2] }),
-                _ => Some(SysCall::Unknown)
+                "sol_memcmp_" => Some(SysCall::MemCmp { s1: args[0], s2: args[1], n: args[2], result: args[3] }),
+                _ => { println!("unhandled syscall {selected_call}"); Some(SysCall::Unknown)}
             };
             println!("found syscall {:?}", self.syscall);
         }
@@ -252,7 +255,7 @@ impl TraceEntry {
             ($vmaddr:ident, $typ:ty, $value:expr) => {
                 {
                     let len = std::mem::size_of::<$typ>();
-                    let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(true)).ok_or(EmulationError::AddressTranslationError{vmaddr:$vmaddr})?;
+                    let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(true))?;
                     let value = $value as $typ as u64;
                     //println!("load form vmaddr {} value {}/{} real value {}", $vmaddr, value, len, mload::<$typ>(phy_addr));
                     mem = Some(MemoryAccess::Read{size: len as u8, value, vmaddr:$vmaddr});
@@ -264,7 +267,7 @@ impl TraceEntry {
             ($vmaddr:ident, $typ:ty, $value:expr) => {
                 {
                     let len = std::mem::size_of::<$typ>() as u8;
-                    let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(false)).ok_or(EmulationError::AddressTranslationError{vmaddr:$vmaddr})?;
+                    let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(false))?;
                     let value = $value as $typ as u64;
                     let before = mload::<$typ>(phy_addr);
                     //println!("store vmaddr {} value {}/{} before {}", $vmaddr, value, len, before);
@@ -444,6 +447,7 @@ macro_rules! instr_invoke_syscall_stub {
                 signers_seeds_len: u64,
                 memory_mapping: &mut MemoryMapping,
             ) -> Result<u64, Box<dyn std::error::Error>> {
+                println!("nested call");
                 let instruction = $translate_instruction(instruction_addr, memory_mapping, invoke_context)?;
 
                 let transaction_context = &invoke_context.transaction_context;
@@ -457,8 +461,10 @@ macro_rules! instr_invoke_syscall_stub {
                     memory_mapping,
                     invoke_context,
                 )?;
+                println!("translated signers");
                 let (instruction_accounts, _) =
                     invoke_context.prepare_instruction(&instruction, &signers)?;
+                println!("prepared instruction");
 
                 if TRACE_IN_PROGRESS.with_borrow(|trace| *trace.borrow()).is_null() {
                     return $syscall::rust(
@@ -705,14 +711,31 @@ impl InstructionTrace {
                         .unwrap_or(u64::MAX)));
 
                 for i in 0..*n {
-                    let srcaddr = address_space.translate_vmaddr(src + i, 1, Some(true)).ok_or(EmulationError::AddressTranslationError { vmaddr: src + i })?;
-                    let dstaddr = address_space.translate_vmaddr(dst + i, 1, Some(true)).ok_or(EmulationError::AddressTranslationError { vmaddr: dst + i })?;
+                    let srcaddr = address_space.translate_vmaddr(src + i, 1, Some(true))?;
+                    let dstaddr = address_space.translate_vmaddr(dst + i, 1, Some(true))?;
                     mstore(dstaddr, mload::<u8>(srcaddr));
                 }
             },
+            SysCall::MemCmp { s1, s2, n, result } => {
+                let mut cmpresult: i32 = 0;
+                for i in 0..*n as usize {
+                    let i = i as u64;
+                    let faddr = address_space.translate_vmaddr(*s1 + i, 1, Some(true))?;
+                    let saddr = address_space.translate_vmaddr(*s2 + i, 1, Some(true))?;
+                    let a = mload::<u8>(faddr);
+                    let b = mload::<u8>(saddr);
+                    if a != b {
+                        cmpresult = (a as i32).saturating_sub(b as i32);
+                        break;
+                    };
+                }
+                let result_addr = address_space.translate_vmaddr(*result, std::mem::size_of::<i32>() as u64, Some(true))?;
+                mstore(result_addr, cmpresult);
+
+            }
             SysCall::CPI { entry_num } => {
             },
-            SysCall::Unknown => println!("undefined syscall")
+            SysCall::Unknown => {}
         }
         
         Ok(())
