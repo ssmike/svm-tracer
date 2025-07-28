@@ -144,16 +144,6 @@ pub struct InstructionTraceBuilder {
     err: Rc<RefCell<Option<EmulationError>>>
 }
 
-#[inline]
-fn mload<T: Pod + Into<u64>>(phy_addr: u64) -> u64 {
-    unsafe { std::ptr::read_unaligned::<T>(phy_addr as *const _) }.into()
-}
-
-#[inline]
-fn mstore<T: Pod>(phy_addr: u64, value: T) {
-    unsafe { std::ptr::write_unaligned::<T>(phy_addr as *mut T, value) }.into()
-}
-
 impl AddressSpace {
     fn translate_vmaddr(&self, addr: u64, len: u64, load: Option<bool>) -> Result<u64, EmulationError> {
         for r in self.regions.as_slice().iter().rev() {
@@ -169,15 +159,37 @@ impl AddressSpace {
         Err(EmulationError::AddressTranslationError { vmaddr: addr })
     }
 
+    #[inline]
+    fn mload<T: Pod + Into<u64>>(phy_addr: u64) -> u64 {
+        unsafe { std::ptr::read_unaligned::<T>(phy_addr as *const _) }.into()
+    }
+
+    #[inline]
+    fn mstore<T: Pod>(phy_addr: u64, value: T) {
+        unsafe { std::ptr::write_unaligned::<T>(phy_addr as *mut T, value) }.into()
+    }
+
+    #[inline]
+    pub fn load<T: Pod + Into<u64>>(&self, vmaddr: u64) -> Result<u64, EmulationError> {
+        let phy_addr = self.translate_vmaddr(vmaddr, std::mem::size_of::<T>() as u64, Some(true))?;
+        Ok(Self::mload::<T>(phy_addr))
+    }
+
+    #[inline]
+    fn store<T: Pod>(&mut self, vmaddr: u64, value: T) -> Result<(), EmulationError> {
+        let phy_addr = self.translate_vmaddr(vmaddr, std::mem::size_of::<T>() as u64, Some(false))?;
+        Ok(Self::mstore(phy_addr, value))
+    }
+
     pub fn replay(&mut self, op: MemoryAccess) -> Result<(), EmulationError> {
         match op {
             MemoryAccess::Write{value, vmaddr, size, ..} => {
                 let phy_addr = self.translate_vmaddr(vmaddr, size as u64, Some(false))?;
                 match size {
-                    1 => mstore(phy_addr, value as u8),
-                    2 => mstore(phy_addr, value as u16),
-                    4 => mstore(phy_addr, value as u32),
-                    8 => mstore(phy_addr, value as u64),
+                    1 => Self::mstore(phy_addr, value as u8),
+                    2 => Self::mstore(phy_addr, value as u16),
+                    4 => Self::mstore(phy_addr, value as u32),
+                    8 => Self::mstore(phy_addr, value as u64),
                     _ => {}
                 }
             },
@@ -239,10 +251,12 @@ impl TraceEntry {
             ($vmaddr:ident, $typ:ty, $value:expr) => {
                 {
                     let len = std::mem::size_of::<$typ>();
-                    let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(true))?;
                     let value = $value as $typ as u64;
-                    mem = Some(MemoryAccess::Read{size: len as u8, value, vmaddr:$vmaddr});
-                    assert!(mload::<$typ>(phy_addr) == value);
+                    let vmaddr = $vmaddr;
+                    mem = Some(MemoryAccess::Read{size: len as u8, value, vmaddr:vmaddr});
+                    if address_space.load::<$typ>(vmaddr)? != value {
+                        return Err(EmulationError::MemoryConsistencyCheck{vmaddr, value: value as u64});
+                    }
                 }
             }
         }
@@ -250,9 +264,9 @@ impl TraceEntry {
             ($vmaddr:ident, $typ:ty, $value:expr) => {
                 {
                     let len = std::mem::size_of::<$typ>() as u8;
-                    let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(false))?;
+                    let vmaddr = $vmaddr;
                     let value = $value as $typ as u64;
-                    let before = mload::<$typ>(phy_addr);
+                    let before = address_space.load::<$typ>(vmaddr)?;
                     mem = Some(MemoryAccess::Write { size: len, vmaddr: $vmaddr, before, value });
                 }
             }
@@ -749,9 +763,7 @@ impl InstructionTrace {
         match op {
             SysCall::MemCpy { dst, src, n} => {
                 for i in 0..*n {
-                    let srcaddr = address_space.translate_vmaddr(src + i, 1, Some(true))?;
-                    let dstaddr = address_space.translate_vmaddr(dst + i, 1, Some(true))?;
-                    mstore(dstaddr, mload::<u8>(srcaddr));
+                    address_space.store::<u8>(dst + i, address_space.load::<u8>(src + i)? as u8)?;
                 }
                 consume_mem_op!(n);
             },
@@ -759,17 +771,14 @@ impl InstructionTrace {
                 let mut cmpresult: i32 = 0;
                 for i in 0..*n as usize {
                     let i = i as u64;
-                    let faddr = address_space.translate_vmaddr(*s1 + i, 1, Some(true))?;
-                    let saddr = address_space.translate_vmaddr(*s2 + i, 1, Some(true))?;
-                    let a = mload::<u8>(faddr);
-                    let b = mload::<u8>(saddr);
+                    let a = address_space.load::<u8>(*s1 + i)?;
+                    let b = address_space.load::<u8>(*s2 + i)?;
                     if a != b {
                         cmpresult = (a as i32).saturating_sub(b as i32);
                         break;
                     };
                 }
-                let result_addr = address_space.translate_vmaddr(*result, std::mem::size_of::<i32>() as u64, Some(true))?;
-                mstore(result_addr, cmpresult);
+                address_space.store(*result, cmpresult)?;
                 consume_mem_op!(n);
             }
             SysCall::CPI(cpi_entry) => {
@@ -806,7 +815,7 @@ impl InstructionTrace {
             let cur = &mut self.entries[frame_number][i];
             cur.cu_meter_before = cu_before;
             cur.cu_meter = cu_meter.clone();
-            cur.fill_memory_access(&address_space, self.conf[frame_number].move_memory_instruction_classes).unwrap();
+            cur.fill_memory_access(&address_space, self.conf[frame_number].move_memory_instruction_classes)?;
 
             {
                 let mut selected_call: Option<&str> = None;
