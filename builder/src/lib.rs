@@ -23,7 +23,6 @@ pub enum EmulationError {
     AddressTranslationError{vmaddr: u64},
     MemoryConsistencyCheck{vmaddr: u64, value: u64},
     InstructionError(InstructionError),
-    CPIEntryUnmatched{cu_meter: u64}
 }
 
 impl std::error::Error for EmulationError { }
@@ -33,7 +32,6 @@ impl std::fmt::Display for EmulationError {
         match self {
             Self::AddressTranslationError { vmaddr } => write!(f, "address translation {vmaddr} failed"),
             Self::MemoryConsistencyCheck { vmaddr, value } => write!(f, "memory load consistency check {vmaddr} with value {value}"),
-            Self::CPIEntryUnmatched { cu_meter } => write!(f, "failed to handle cpi_call at cu_meter = {cu_meter}"),
             Self::InstructionError(err) => std::fmt::Display::fmt(&err, f)
         }
     }
@@ -89,7 +87,7 @@ pub struct CPIEntry {
 pub enum SysCall {
     MemCpy{dst: u64, src: u64, n: u64},
     MemCmp{s1: u64, s2: u64, n: u64, result: u64},
-    CPI{ entry_num: usize },
+    CPI(CPIEntry),
     Unknown
 }
 
@@ -243,7 +241,6 @@ impl TraceEntry {
                     let len = std::mem::size_of::<$typ>();
                     let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(true))?;
                     let value = $value as $typ as u64;
-                    //println!("load form vmaddr {} value {}/{} real value {}", $vmaddr, value, len, mload::<$typ>(phy_addr));
                     mem = Some(MemoryAccess::Read{size: len as u8, value, vmaddr:$vmaddr});
                     assert!(mload::<$typ>(phy_addr) == value);
                 }
@@ -256,7 +253,6 @@ impl TraceEntry {
                     let phy_addr = address_space.translate_vmaddr($vmaddr, len as u64, Some(false))?;
                     let value = $value as $typ as u64;
                     let before = mload::<$typ>(phy_addr);
-                    //println!("store vmaddr {} value {}/{} before {}", $vmaddr, value, len, before);
                     mem = Some(MemoryAccess::Write { size: len, vmaddr: $vmaddr, before, value });
                 }
             }
@@ -378,8 +374,8 @@ impl InstructionTraceBuilder {
 
         let mut cb: Box<dyn InvocationInspectCallback> = Box::new(this.clone());
         mem::swap(&mut cb, &mut mollusk.invocation_inspect_callback);
-        TRACE_IN_PROGRESS.with(|addr| addr.replace(std::ptr::null_mut()));
         let result = mollusk.process_instruction(instruction, accounts);
+        TRACE_IN_PROGRESS.with(|addr| addr.replace(std::ptr::null_mut()));
 
         if let Some(err) = RefCell::borrow_mut(&this.err).take() {
             return Err(err)
@@ -433,7 +429,6 @@ macro_rules! instr_invoke_syscall_stub {
                 signers_seeds_len: u64,
                 memory_mapping: &mut MemoryMapping,
             ) -> Result<u64, Box<dyn std::error::Error>> {
-                println!("nested call");
                 if TRACE_IN_PROGRESS.with_borrow(|trace| *trace.borrow()).is_null() {
                     return $syscall::rust(
                         invoke_context,
@@ -615,6 +610,8 @@ impl InstructionTrace {
 
         self.feature_set = mollusk.feature_set.clone();
         self.compute_budget = mollusk.compute_budget.clone();
+
+        TRACE_IN_PROGRESS.with(|addr| addr.replace(self as *mut Self));
     }
 
     fn push_frame(&mut self, cu_meter: u64) {
@@ -696,19 +693,16 @@ impl InstructionTrace {
                 // as we copied ro memory it should start from the same vmaddr
                 ro_mem_region.host_addr.set(ro_mem.as_slice().as_ptr() as u64);
                 address_space.mem.push(ro_mem);
-                debug_display_region("romem", &ro_mem_region);
                 address_space.regions.push(ro_mem_region);
 
                 let stack_size = executable.get_config().stack_size() as usize;
 
                 // heap memory
                 let mut heap_memory = AlignedMemory::<{solana_sbpf::ebpf::HOST_ALIGN}>::zero_filled(heap_size);
-                println!("heap {} {}", solana_sbpf::ebpf::MM_HEAP_START, solana_sbpf::ebpf::MM_HEAP_START + heap_size as u64);
                 address_space.regions.push(MemoryRegion::new_writable(heap_memory.as_slice_mut(), solana_sbpf::ebpf::MM_HEAP_START));
                 address_space.mem.push(heap_memory);
 
                 // stack memory
-                println!("stack configuration {} {} ", executable.get_config().stack_size(), executable.get_config().stack_frame_size);
                 let mut stack_memory = AlignedMemory::<{solana_sbpf::ebpf::HOST_ALIGN}>::zero_filled(stack_size);
                 address_space.regions.push(
                     MemoryRegion::new_writable_gapped(
@@ -721,7 +715,6 @@ impl InstructionTrace {
                         },
                     )
                 );
-                debug_display_region("stack", address_space.regions.last().unwrap());
                 address_space.mem.push(stack_memory);
 
                 self.conf.push(InstructionConf{ move_memory_instruction_classes: executable.get_sbpf_version().move_memory_instruction_classes() });
@@ -739,8 +732,6 @@ impl InstructionTrace {
         address_space.mem.push(serialized);
         address_space.regions.extend(regions.into_iter());
         address_space.accounts = accounts_metadata;
-
-        TRACE_IN_PROGRESS.with(|addr| addr.replace(self as *mut Self));
 
         Ok(self.cur_frame)
     }
@@ -781,7 +772,7 @@ impl InstructionTrace {
                 mstore(result_addr, cmpresult);
                 consume_mem_op!(n);
             }
-            SysCall::CPI { entry_num } => {
+            SysCall::CPI(cpi_entry) => {
             },
             SysCall::Unknown => {}
         }
@@ -799,6 +790,8 @@ impl InstructionTrace {
             |regs| TraceEntry::new(regs, &self.address_space[frame_number]))
                 .collect::<Vec<TraceEntry>>();
         let mut address_space = self.address_space[frame_number].clone();
+        let mut cpi_entries = self.cpi_calls.clone().into_iter().filter(|x| x.caller_frame == frame_number);
+
         for i in 0..self.entries[frame_number].len() {
             let cu_before = cu_meter.clone();
             cu_meter.consume_cu(1);
@@ -828,18 +821,7 @@ impl InstructionTrace {
                     cur.syscall = match selected_call {
                         "sol_memcpy_" => Some(SysCall::MemCpy { src: args[1], dst: args[0], n: args[2] }),
                         "sol_memcmp_" => Some(SysCall::MemCmp { s1: args[0], s2: args[1], n: args[2], result: args[3] }),
-                        "sol_invoke_signed_rust" => {
-                            let entry_num = self.cpi_calls 
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, x)| x.cu_meter_before == cu_meter )
-                                .take(1)
-                                .last()
-                                .ok_or(EmulationError::CPIEntryUnmatched { cu_meter: cu_meter.clone().into() })?
-                                .0;
-
-                            Some(SysCall::CPI { entry_num })
-                        },
+                        "sol_invoke_signed_rust" => Some(SysCall::CPI (cpi_entries.next().expect("unmatched cpi entry").clone())),
                         _ => { println!("unhandled syscall {selected_call}"); Some(SysCall::Unknown)}
                     };
                     println!("found syscall {:?}", cur.syscall);
@@ -854,6 +836,7 @@ impl InstructionTrace {
                 self.replay_syscall(&mut cu_meter, &mut address_space, syscall)?;
             }
         }
+        assert!(cpi_entries.next().is_none());
 
         self.cu_meter_final_value[frame_number] = cu_meter;
 
