@@ -23,6 +23,7 @@ pub enum EmulationError {
     AddressTranslationError{vmaddr: u64},
     MemoryConsistencyCheck{vmaddr: u64, value: u64},
     InstructionError(InstructionError),
+    CPIEntryUnmatched{cu_meter: u64}
 }
 
 impl std::error::Error for EmulationError { }
@@ -32,6 +33,7 @@ impl std::fmt::Display for EmulationError {
         match self {
             Self::AddressTranslationError { vmaddr } => write!(f, "address translation {vmaddr} failed"),
             Self::MemoryConsistencyCheck { vmaddr, value } => write!(f, "memory load consistency check {vmaddr} with value {value}"),
+            Self::CPIEntryUnmatched { cu_meter } => write!(f, "failed to handle cpi_call at cu_meter = {cu_meter}"),
             Self::InstructionError(err) => std::fmt::Display::fmt(&err, f)
         }
     }
@@ -79,8 +81,8 @@ pub struct CPIEntry {
     pub callee_frame: usize,
     pub caller_frame: usize,
 
-    pub cu_meter_before: u64,
-    pub cu_meter_after: u64
+    pub cu_meter_before: CuMeter,
+    pub cu_meter_after: CuMeter
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +93,9 @@ pub enum SysCall {
     Unknown
 }
 
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct CuMeter(u64);
+
 #[derive(Debug, Clone)]
 pub struct TraceEntry {
     pub regs_after: [u64; 12],
@@ -100,9 +105,9 @@ pub struct TraceEntry {
     pub mem: Option<MemoryAccess>,
     pub syscall: Option<SysCall>,
 
-    pub cu_meter_before: u64,
+    pub cu_meter_before: CuMeter,
     // after execution
-    pub cu_meter: u64
+    pub cu_meter: CuMeter
 }
 
 #[derive(Debug, Default)]
@@ -122,8 +127,8 @@ pub struct InstructionTrace {
 
     registered_syscalls: BTreeMap<u32, String>,
 
-    pub cu_meter: u64,
-    pub cu_initial_value: u64,
+    pub cu_meter_final_value: Vec<CuMeter>,
+    pub cu_initial_value: Vec<CuMeter>,
 
     pub cpi_calls: Vec<CPIEntry>,
 
@@ -226,25 +231,6 @@ impl Clone for AddressSpace {
 }
 
 impl TraceEntry {
-    fn fill_syscall(&mut self, registered_syscalls: &BTreeMap<u32, String>) {
-        let mut selected_call: Option<&str> = None;
-        let args = &self.regs_before[1..6];
-        if self.insn.opc == solana_sbpf::ebpf::SYSCALL {
-            selected_call = registered_syscalls.get(&(self.insn.imm as u32)).map(|r| r.as_str());
-        }
-        if self.insn.opc == solana_sbpf::ebpf::CALL_IMM {
-            selected_call = registered_syscalls.get(&(self.insn.imm as u32)).map(|r| r.as_str());
-        }
-        if let Some(selected_call) = selected_call { 
-            self.syscall = match selected_call {
-                "sol_memcpy_" => Some(SysCall::MemCpy { src: args[1], dst: args[0], n: args[2] }),
-                "sol_memcmp_" => Some(SysCall::MemCmp { s1: args[0], s2: args[1], n: args[2], result: args[3] }),
-                _ => { println!("unhandled syscall {selected_call}"); Some(SysCall::Unknown)}
-            };
-            println!("found syscall {:?}", self.syscall);
-        }
-    }
-
     fn fill_memory_access(&mut self, address_space: &AddressSpace, move_memory_instruction_classes: bool) -> Result<(), EmulationError> {
         let src = self.insn.src as usize;
         let dst = self.insn.dst as usize;
@@ -343,8 +329,8 @@ impl TraceEntry {
             insn,
             mem: None,
             syscall: None,
-            cu_meter: 0,
-            cu_meter_before: 0
+            cu_meter: 0.into(),
+            cu_meter_before: 0.into()
         }
     }
 }
@@ -448,24 +434,6 @@ macro_rules! instr_invoke_syscall_stub {
                 memory_mapping: &mut MemoryMapping,
             ) -> Result<u64, Box<dyn std::error::Error>> {
                 println!("nested call");
-                let instruction = $translate_instruction(instruction_addr, memory_mapping, invoke_context)?;
-
-                let transaction_context = &invoke_context.transaction_context;
-                let instruction_context = transaction_context.get_current_instruction_context()?;
-                let caller_program_id = instruction_context.get_last_program_key(transaction_context)?;
-
-                let signers = $translate_signers(
-                    caller_program_id,
-                    signers_seeds_addr,
-                    signers_seeds_len,
-                    memory_mapping,
-                    invoke_context,
-                )?;
-                println!("translated signers");
-                let (instruction_accounts, _) =
-                    invoke_context.prepare_instruction(&instruction, &signers)?;
-                println!("prepared instruction");
-
                 if TRACE_IN_PROGRESS.with_borrow(|trace| *trace.borrow()).is_null() {
                     return $syscall::rust(
                         invoke_context,
@@ -477,10 +445,57 @@ macro_rules! instr_invoke_syscall_stub {
                         memory_mapping);
                 }
 
+                macro_rules! check_call {
+                    ($e:expr) => {
+                        {
+                            let result = $e;
+
+                            if result.is_err() {
+                                TRACE_IN_PROGRESS.with_borrow_mut(|trace| {
+                                        let trace: &mut InstructionTrace = unsafe{&mut (**trace)};
+                                        let meter = solana_sbpf::vm::ContextObject::get_remaining(invoke_context);
+                                        trace.cpi_calls.push(
+                                            CPIEntry {
+                                                kind: $kind,
+                                                program: Pubkey::from([0 as u8; 32]),
+                                                instruction_data: vec![],
+                                                instruction_accounts: vec![],
+                                                caller_frame: trace.cur_frame,
+                                                callee_frame: 0,
+                                                cu_meter_before: meter.into(),
+                                                cu_meter_after: meter.into(),
+                                                return_data: vec![]
+                                            });
+                                    });
+                            }
+
+                            result?
+                        }
+                    }
+                }
+
+                let instruction = check_call!($translate_instruction(instruction_addr, memory_mapping, invoke_context));
+
+                let transaction_context = &invoke_context.transaction_context;
+                let instruction_context = check_call!(transaction_context.get_current_instruction_context());
+                let caller_program_id = check_call!(instruction_context.get_last_program_key(transaction_context));
+
+                let signers = check_call!(
+                    $translate_signers(
+                        caller_program_id,
+                        signers_seeds_addr,
+                        signers_seeds_len,
+                        memory_mapping,
+                        invoke_context,
+                    ));
+
+                let (instruction_accounts, _) = check_call!(invoke_context.prepare_instruction(&instruction, &signers));
+
                 let mut cpi_number: usize = 0;
                 let frame_number = TRACE_IN_PROGRESS.with_borrow_mut(|trace| {
                     let trace: &mut InstructionTrace = unsafe{&mut (**trace)};
                     cpi_number = trace.cpi_calls.len();
+                    let meter = solana_sbpf::vm::ContextObject::get_remaining(invoke_context);
                     trace.cpi_calls.push(
                         CPIEntry {
                             kind: $kind,
@@ -489,8 +504,8 @@ macro_rules! instr_invoke_syscall_stub {
                             instruction_accounts: instruction_accounts.clone(),
                             caller_frame: trace.cur_frame,
                             callee_frame: 0,
-                            cu_meter_before: trace.cu_meter,
-                            cu_meter_after: 0,
+                            cu_meter_before: meter.into(),
+                            cu_meter_after: meter.into(),
                             return_data: vec![]
                         });
 
@@ -514,7 +529,8 @@ macro_rules! instr_invoke_syscall_stub {
                     let trace: &mut InstructionTrace = unsafe{&mut (**trace)};
                     trace.cpi_calls[cpi_number].callee_frame = frame_number;
                     let result = trace.finalize_frame(invoke_context);
-                    trace.cpi_calls[cpi_number].cu_meter_after = trace.cu_meter;
+                    let meter = solana_sbpf::vm::ContextObject::get_remaining(invoke_context);
+                    trace.cpi_calls[cpi_number].cu_meter_after = meter.into();
                     result
                 })?;
 
@@ -538,8 +554,8 @@ impl Default for InstructionTrace {
             feature_set: FeatureSet::default(),
             compute_budget: ComputeBudget::default(),
             registered_syscalls: BTreeMap::new(),
-            cu_meter: 0,
-            cu_initial_value: 0,
+            cu_initial_value: vec![],
+            cu_meter_final_value: vec![],
             cpi_calls: vec![],
             cur_frame: 0,
             cpi_caller: vec![],
@@ -554,11 +570,37 @@ pub fn debug_display_region(display: &str, r: &MemoryRegion) {
     println!("{display} memory region {} {} / {}", r.vm_addr, r.vm_addr_end, r.vm_gap_shift);
 }
 
-impl InstructionTrace {
-    fn consume_cu(&mut self, value: u64) {
-        self.cu_meter = self.cu_meter.saturating_sub(value);
-    }
 
+impl CuMeter {
+    fn consume_cu(&mut self, value: u64) {
+        self.0 = self.0.saturating_sub(value);
+    } 
+
+    pub fn diff(&self, cu_meter: &CuMeter) -> u64 {
+        self.0.saturating_sub(cu_meter.0)
+    }
+}    
+
+impl From<u64> for CuMeter {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl Into<u64> for CuMeter {
+    fn into(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CuMeter {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(f, "cu meter ({})", self.0)
+    }
+}
+
+
+impl InstructionTrace {
     fn configure(&mut self, mollusk: &Mollusk) {
         for (key, (name, _)) in mollusk
             .program_cache
@@ -573,11 +615,9 @@ impl InstructionTrace {
 
         self.feature_set = mollusk.feature_set.clone();
         self.compute_budget = mollusk.compute_budget.clone();
-        self.cu_meter = self.compute_budget.compute_unit_limit;
-        self.cu_initial_value = self.compute_budget.compute_unit_limit;
     }
 
-    fn push_frame(&mut self) {
+    fn push_frame(&mut self, cu_meter: u64) {
         let caller = self.cur_frame;
         let calee = self.address_space.len();
 
@@ -586,6 +626,9 @@ impl InstructionTrace {
 
         self.cpi_caller.push(caller);
         self.cur_frame = calee;
+
+        self.cu_initial_value.push(cu_meter.into());
+        self.cu_meter_final_value.push(cu_meter.into());
     }
 
     fn pop_frame(&mut self) {
@@ -622,9 +665,9 @@ impl InstructionTrace {
 
         let runtime_features = self.feature_set.runtime_features();
         let heap_size = self.compute_budget.heap_size as usize;
-        self.consume_cu(calculate_heap_cost(heap_size as u32, self.compute_budget.to_cost().heap_cost));
+        self.push_frame(solana_sbpf::vm::ContextObject::get_remaining(invoke_context));
+        self.cu_initial_value[self.cur_frame].consume_cu(calculate_heap_cost(heap_size as u32, self.compute_budget.to_cost().heap_cost));
 
-        self.push_frame();
         let address_space = self.address_space.last_mut().unwrap();
         self.instructions.push(Instruction {
             program_id: *program_id,
@@ -702,19 +745,24 @@ impl InstructionTrace {
         Ok(self.cur_frame)
     }
 
-    fn replay_syscall(&mut self, address_space: &mut AddressSpace, op: &SysCall) -> Result<(), EmulationError> {
+    fn replay_syscall(&mut self, cu_meter: &mut CuMeter, address_space: &mut AddressSpace, op: &SysCall) -> Result<(), EmulationError> {
+        macro_rules! consume_mem_op {
+            ($n: expr) => {
+                let cost = self.compute_budget.to_cost();
+                cu_meter.consume_cu(cost.mem_op_base_cost.max(
+                    $n.checked_div(cost.cpi_bytes_per_unit)
+                        .unwrap_or(u64::MAX)));
+            }
+        }
+
         match op {
             SysCall::MemCpy { dst, src, n} => {
-                let cost = self.compute_budget.to_cost();
-                self.consume_cu(cost.mem_op_base_cost.max(
-                    n.checked_div(cost.cpi_bytes_per_unit)
-                        .unwrap_or(u64::MAX)));
-
                 for i in 0..*n {
                     let srcaddr = address_space.translate_vmaddr(src + i, 1, Some(true))?;
                     let dstaddr = address_space.translate_vmaddr(dst + i, 1, Some(true))?;
                     mstore(dstaddr, mload::<u8>(srcaddr));
                 }
+                consume_mem_op!(n);
             },
             SysCall::MemCmp { s1, s2, n, result } => {
                 let mut cmpresult: i32 = 0;
@@ -731,7 +779,7 @@ impl InstructionTrace {
                 }
                 let result_addr = address_space.translate_vmaddr(*result, std::mem::size_of::<i32>() as u64, Some(true))?;
                 mstore(result_addr, cmpresult);
-
+                consume_mem_op!(n);
             }
             SysCall::CPI { entry_num } => {
             },
@@ -743,6 +791,7 @@ impl InstructionTrace {
 
     fn finalize_frame(&mut self, ctx: &InvokeContext) -> Result<(), EmulationError> {
         let frame_number = self.cur_frame;
+        let mut cu_meter = self.cu_initial_value[frame_number].clone();
         self.pop_frame();
 
         let trace = ctx.get_traces().last().unwrap();
@@ -751,8 +800,8 @@ impl InstructionTrace {
                 .collect::<Vec<TraceEntry>>();
         let mut address_space = self.address_space[frame_number].clone();
         for i in 0..self.entries[frame_number].len() {
-            let cu_before = self.cu_meter;
-            self.consume_cu(1);
+            let cu_before = cu_meter.clone();
+            cu_meter.consume_cu(1);
             {
                 let slice = &mut self.entries[frame_number][i..];
                 let (fs, sc) = slice.split_at_mut(1);
@@ -763,18 +812,50 @@ impl InstructionTrace {
 
             let cur = &mut self.entries[frame_number][i];
             cur.cu_meter_before = cu_before;
-            cur.cu_meter = self.cu_meter;
+            cur.cu_meter = cu_meter.clone();
             cur.fill_memory_access(&address_space, self.conf[frame_number].move_memory_instruction_classes).unwrap();
-            cur.fill_syscall(&self.registered_syscalls);
+
+            {
+                let mut selected_call: Option<&str> = None;
+                let args = &cur.regs_before[1..6];
+                if cur.insn.opc == solana_sbpf::ebpf::SYSCALL {
+                    selected_call = self.registered_syscalls.get(&(cur.insn.imm as u32)).map(|r| r.as_str());
+                }
+                if cur.insn.opc == solana_sbpf::ebpf::CALL_IMM {
+                    selected_call = self.registered_syscalls.get(&(cur.insn.imm as u32)).map(|r| r.as_str());
+                }
+                if let Some(selected_call) = selected_call { 
+                    cur.syscall = match selected_call {
+                        "sol_memcpy_" => Some(SysCall::MemCpy { src: args[1], dst: args[0], n: args[2] }),
+                        "sol_memcmp_" => Some(SysCall::MemCmp { s1: args[0], s2: args[1], n: args[2], result: args[3] }),
+                        "sol_invoke_signed_rust" => {
+                            let entry_num = self.cpi_calls 
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, x)| x.cu_meter_before == cu_meter )
+                                .take(1)
+                                .last()
+                                .ok_or(EmulationError::CPIEntryUnmatched { cu_meter: cu_meter.clone().into() })?
+                                .0;
+
+                            Some(SysCall::CPI { entry_num })
+                        },
+                        _ => { println!("unhandled syscall {selected_call}"); Some(SysCall::Unknown)}
+                    };
+                    println!("found syscall {:?}", cur.syscall);
+                }
+            }
 
             let cur = cur.clone();
             if let Some(op@MemoryAccess::Write {..}) = &cur.mem {
                 address_space.replay(op.clone())?;
             }
             if let Some(ref syscall) = &cur.syscall {
-                self.replay_syscall(&mut address_space, syscall)?;
+                self.replay_syscall(&mut cu_meter, &mut address_space, syscall)?;
             }
         }
+
+        self.cu_meter_final_value[frame_number] = cu_meter;
 
         Ok(())
     }
