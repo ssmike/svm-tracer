@@ -9,3 +9,5 @@ solana-program-runtime.workspace = true
 solana-compute-budget = {workspace = true}
 agave-feature-set = {workspace = true}
 svm-tracer = { workspace = true }
+log.workspace = true
+env_logger = "0.11.8"

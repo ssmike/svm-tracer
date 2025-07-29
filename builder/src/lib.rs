@@ -13,55 +13,17 @@ use {
     solana_transaction_context::{InstructionAccount, InstructionContext, IndexOfAccount},
     solana_bpf_loader_program::{calculate_heap_cost, syscalls::{SyscallInvokeSignedC, SyscallInvokeSignedRust}},
     std::{cell::RefCell, rc::Rc, borrow::Borrow},
+    log::{debug,error},
 };
+
+pub mod error;
+use error::EmulationError;
+
+pub mod memory;
+use memory::*;
 
 mod syscall_decode;
 use syscall_decode::{translate_signers_c, translate_instruction_c, translate_signers_rust, translate_instruction_rust};
-
-#[derive(Debug)]
-pub enum EmulationError {
-    AddressTranslationError{vmaddr: u64},
-    MemoryConsistencyCheck{vmaddr: u64, value: u64},
-    InstructionError(InstructionError),
-}
-
-impl std::error::Error for EmulationError { }
-
-impl std::fmt::Display for EmulationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AddressTranslationError { vmaddr } => write!(f, "address translation {vmaddr} failed"),
-            Self::MemoryConsistencyCheck { vmaddr, value } => write!(f, "memory load consistency check {vmaddr} with value {value}"),
-            Self::InstructionError(err) => std::fmt::Display::fmt(&err, f)
-        }
-    }
-}
-
-// Initial memory layout for an instruction without stack and heap.
-#[derive(Debug, Default)]
-pub struct AddressSpace {
-    pub regions: Vec<MemoryRegion>,
-    pub accounts: Vec<SerializedAccountMetadata>,
-    mem: Vec<AlignedMemory<{solana_sbpf::ebpf::HOST_ALIGN}>>,
-
-    pub text_vmaddr: u64,
-    pub text: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub enum MemoryAccess {
-    Read{
-        size: u8,
-        vmaddr: u64,
-        value: u64,
-    },
-    Write{
-        size: u8,
-        vmaddr: u64,
-        before: u64,
-        value: u64
-    }
-}
 
 #[derive(Debug, Clone)]
 pub enum CPIKind {
@@ -80,7 +42,7 @@ pub struct CPIEntry {
     pub caller_frame: usize,
 
     pub cu_meter_before: CuMeter,
-    pub cu_meter_after: CuMeter
+    pub cu_meter_after: CuMeter,
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +50,7 @@ pub enum SysCall {
     MemCpy{dst: u64, src: u64, n: u64},
     MemCmp{s1: u64, s2: u64, n: u64, result: u64},
     CPI(CPIEntry),
-    Unknown
+    Unknown(String)
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -110,7 +72,8 @@ pub struct TraceEntry {
 
 #[derive(Debug, Default)]
 pub struct InstructionConf {
-    move_memory_instruction_classes: bool
+    pub move_memory_instruction_classes: bool,
+    pub loader_v1: bool,
 }
 
 #[derive(Debug)]
@@ -142,102 +105,6 @@ pub struct InstructionTrace {
 pub struct InstructionTraceBuilder {
     trace: Rc<RefCell<Option<InstructionTrace>>>,
     err: Rc<RefCell<Option<EmulationError>>>
-}
-
-impl AddressSpace {
-    fn translate_vmaddr(&self, addr: u64, len: u64, load: Option<bool>) -> Result<u64, EmulationError> {
-        for r in self.regions.as_slice().iter().rev() {
-            if let Some(addr) = r.vm_to_host(addr, len) {
-                return match load {
-                    Some(true) => Ok(addr),
-                    None => Ok(addr),
-                    Some(false) => { if !r.writable.get() { Err(EmulationError::AddressTranslationError { vmaddr: addr }) } else { Ok(addr) } }
-                };
-            }
-        }
-
-        Err(EmulationError::AddressTranslationError { vmaddr: addr })
-    }
-
-    #[inline]
-    fn mload<T: Pod + Into<u64>>(phy_addr: u64) -> u64 {
-        unsafe { std::ptr::read_unaligned::<T>(phy_addr as *const _) }.into()
-    }
-
-    #[inline]
-    fn mstore<T: Pod>(phy_addr: u64, value: T) {
-        unsafe { std::ptr::write_unaligned::<T>(phy_addr as *mut T, value) }.into()
-    }
-
-    #[inline]
-    pub fn load<T: Pod + Into<u64>>(&self, vmaddr: u64) -> Result<u64, EmulationError> {
-        let phy_addr = self.translate_vmaddr(vmaddr, std::mem::size_of::<T>() as u64, Some(true))?;
-        Ok(Self::mload::<T>(phy_addr))
-    }
-
-    #[inline]
-    fn store<T: Pod>(&mut self, vmaddr: u64, value: T) -> Result<(), EmulationError> {
-        let phy_addr = self.translate_vmaddr(vmaddr, std::mem::size_of::<T>() as u64, Some(false))?;
-        Ok(Self::mstore(phy_addr, value))
-    }
-
-    pub fn replay(&mut self, op: MemoryAccess) -> Result<(), EmulationError> {
-        match op {
-            MemoryAccess::Write{value, vmaddr, size, ..} => {
-                let phy_addr = self.translate_vmaddr(vmaddr, size as u64, Some(false))?;
-                match size {
-                    1 => Self::mstore(phy_addr, value as u8),
-                    2 => Self::mstore(phy_addr, value as u16),
-                    4 => Self::mstore(phy_addr, value as u32),
-                    8 => Self::mstore(phy_addr, value as u64),
-                    _ => {}
-                }
-            },
-            _ => {}
-        };
-
-        Ok(())
-    }
-}
-
-impl Clone for AddressSpace {
-    fn clone(&self) -> Self {
-        let mut regions: Vec<MemoryRegion> = vec![];
-        let mem = self.mem.clone();
-
-        for region in self.regions.as_slice() {
-            let mut regions_found = 0;
-            let mut host_addr: u64 = 0;
-            for i in 0..mem.len() {
-                let slice = self.mem[i].as_slice();
-                let start = slice.as_ptr() as u64;
-                let size = slice.len() as u64;
-                let addr = region.host_addr.get();
-                if start <= addr && addr <= start + size {
-                    host_addr = mem[i].as_slice().as_ptr() as u64;
-                    regions_found += 1;
-                }
-            }
-            assert!(regions_found == 1);
-            regions.push(MemoryRegion {
-                host_addr: host_addr.into(),
-                vm_addr: region.vm_addr,
-                vm_addr_end: region.vm_addr_end,
-                len: region.len,
-                vm_gap_shift: region.vm_gap_shift,
-                writable: region.writable.clone(),
-                cow_callback_payload: region.cow_callback_payload
-            });
-        }
-
-        Self {
-            regions,
-            mem,
-            accounts: self.accounts.clone(),
-            text: self.text.clone(),
-            text_vmaddr: self.text_vmaddr
-        }
-    }
 }
 
 impl TraceEntry {
@@ -454,6 +321,8 @@ macro_rules! instr_invoke_syscall_stub {
                         memory_mapping);
                 }
 
+                let check_aligned = invoke_context.get_check_aligned();
+
                 macro_rules! check_call {
                     ($e:expr) => {
                         {
@@ -483,7 +352,7 @@ macro_rules! instr_invoke_syscall_stub {
                     }
                 }
 
-                let instruction = check_call!($translate_instruction(instruction_addr, memory_mapping, invoke_context));
+                let instruction = check_call!($translate_instruction(instruction_addr, memory_mapping, check_aligned));
 
                 let transaction_context = &invoke_context.transaction_context;
                 let instruction_context = check_call!(transaction_context.get_current_instruction_context());
@@ -495,7 +364,7 @@ macro_rules! instr_invoke_syscall_stub {
                         signers_seeds_addr,
                         signers_seeds_len,
                         memory_mapping,
-                        invoke_context,
+                        check_aligned,
                     ));
 
                 let (instruction_accounts, _) = check_call!(invoke_context.prepare_instruction(&instruction, &signers));
@@ -550,8 +419,19 @@ macro_rules! instr_invoke_syscall_stub {
     };
 }
 
-instr_invoke_syscall_stub!(SyscallInvokeSignedCStub, SyscallInvokeSignedC, translate_instruction_c, translate_signers_c, CPIKind::C);
-instr_invoke_syscall_stub!(SyscallInvokeSignedRustStub, SyscallInvokeSignedRust, translate_instruction_rust, translate_signers_rust, CPIKind::Rust);
+instr_invoke_syscall_stub!(
+    SyscallInvokeSignedCStub,
+    SyscallInvokeSignedC,
+    translate_instruction_c,
+    translate_signers_c,
+    CPIKind::C);
+
+instr_invoke_syscall_stub!(
+    SyscallInvokeSignedRustStub,
+    SyscallInvokeSignedRust,
+    translate_instruction_rust,
+    translate_signers_rust,
+    CPIKind::Rust);
 
 impl Default for InstructionTrace {
     fn default() -> Self {
@@ -583,7 +463,7 @@ pub fn debug_display_region(display: &str, r: &MemoryRegion) {
 impl CuMeter {
     fn consume_cu(&mut self, value: u64) {
         self.0 = self.0.saturating_sub(value);
-    } 
+    }
 
     pub fn diff(&self, cu_meter: &CuMeter) -> u64 {
         self.0.saturating_sub(cu_meter.0)
@@ -659,6 +539,7 @@ impl InstructionTrace {
 
         let cache_entry = cache.find(&program_id).or_panic_with(MolluskError::ProgramNotCached(&program_id));
         let cache_entry_type = &cache_entry.program;
+        let loader_v1 = cache_entry.account_owner == ProgramCacheEntryOwner::LoaderV1;
         match cache_entry.account_owner {
             ProgramCacheEntryOwner::LoaderV1
                 | ProgramCacheEntryOwner::LoaderV2
@@ -731,7 +612,10 @@ impl InstructionTrace {
                 );
                 address_space.mem.push(stack_memory);
 
-                self.conf.push(InstructionConf{ move_memory_instruction_classes: executable.get_sbpf_version().move_memory_instruction_classes() });
+                self.conf.push(InstructionConf{
+                    move_memory_instruction_classes: executable.get_sbpf_version().move_memory_instruction_classes(),
+                    loader_v1
+                });
             },
             _ => panic!("{}", MolluskError::ProgramNotCached(&program_id))
         };
@@ -751,15 +635,17 @@ impl InstructionTrace {
     }
 
     fn replay_syscall(&mut self, cu_meter: &mut CuMeter, address_space: &mut AddressSpace, op: &SysCall) -> Result<(), EmulationError> {
+        let cost = self.compute_budget.to_cost();
         macro_rules! consume_mem_op {
             ($n: expr) => {
-                let cost = self.compute_budget.to_cost();
+
                 cu_meter.consume_cu(cost.mem_op_base_cost.max(
                     $n.checked_div(cost.cpi_bytes_per_unit)
                         .unwrap_or(u64::MAX)));
             }
         }
 
+        debug!("replaying {op:?}");
         match op {
             SysCall::MemCpy { dst, src, n} => {
                 for i in 0..*n {
@@ -782,8 +668,11 @@ impl InstructionTrace {
                 consume_mem_op!(n);
             }
             SysCall::CPI(cpi_entry) => {
+                *cu_meter = cpi_entry.cu_meter_after.clone();
             },
-            SysCall::Unknown => {}
+            SysCall::Unknown(name) => {
+                error!("unhandled syscall {name}");
+            }
         }
         
         Ok(())
@@ -830,10 +719,9 @@ impl InstructionTrace {
                     cur.syscall = match selected_call {
                         "sol_memcpy_" => Some(SysCall::MemCpy { src: args[1], dst: args[0], n: args[2] }),
                         "sol_memcmp_" => Some(SysCall::MemCmp { s1: args[0], s2: args[1], n: args[2], result: args[3] }),
-                        "sol_invoke_signed_rust" => Some(SysCall::CPI (cpi_entries.next().expect("unmatched cpi entry").clone())),
-                        _ => { println!("unhandled syscall {selected_call}"); Some(SysCall::Unknown)}
+                        "sol_invoke_signed_rust" | "sol_invoke_signed_c" => Some(SysCall::CPI (cpi_entries.next().expect("unmatched cpi entry").clone())),
+                        _ => Some(SysCall::Unknown(selected_call.into()))
                     };
-                    println!("found syscall {:?}", cur.syscall);
                 }
             }
 

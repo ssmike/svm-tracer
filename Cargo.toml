@@ -23,6 +23,7 @@ solana-account = "2.2"
 solana-bpf-loader-program = "2.3"
 solana-stable-layout = "2.2.1"
 svm-tracer = { path = "builder" }
+log = "0.4.27"
 
 solana-account-info = "2.2"
 solana-program-entrypoint = "2.2"

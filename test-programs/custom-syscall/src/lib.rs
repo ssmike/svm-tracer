@@ -1,7 +1,9 @@
 #![cfg(target_os = "solana")]
 
+use solana_program::{instruction::{AccountMeta, Instruction}, program::{invoke, invoke_signed}};
 use {solana_account_info::AccountInfo, solana_program_error::ProgramError, solana_pubkey::Pubkey};
 use std::vec::Vec;
+use std::str::FromStr;
 
 // Declare the custom syscall that we expect to be registered.
 // This matches the `sol_burn_cus` syscall from the test.
@@ -14,7 +16,7 @@ solana_program_entrypoint::entrypoint!(process_instruction);
 
 fn process_instruction(
     _program_id: &Pubkey,
-    _accounts: &[AccountInfo],
+    accounts: &[AccountInfo],
     input: &[u8],
 ) -> Result<(), ProgramError> {
     let to_burn = input
@@ -33,6 +35,8 @@ fn process_instruction(
         sol_inspect(fibs.last().unwrap() % 7);
         //sol_burn_cus();
     }
+
+    invoke(&Instruction::new_with_bytes(*accounts[2].key, &[], vec![AccountMeta::new(*accounts[0].key, false), AccountMeta::new_readonly(*accounts[1].key, false)]), accounts);
 
     Ok(())
 }

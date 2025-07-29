@@ -10,6 +10,7 @@ use {
 type Error = Box<dyn std::error::Error>;
 
 const MAX_CPI_INSTRUCTION_DATA_LEN: u64 = 10 * 1024;
+const MAX_CPI_ACCOUNT_INFOS: u64 = 1024;
 
 /// Maximum signers
 const MAX_SIGNERS: usize = 16;
@@ -145,24 +146,24 @@ macro_rules! translate_mut {
 pub fn translate_instruction_rust(
     addr: u64,
     memory_mapping: &MemoryMapping,
-    invoke_context: &mut InvokeContext,
+    check_aligned: bool
 ) -> Result<StableInstruction, Error> {
     let ix = translate_type::<StableInstruction>(
         memory_mapping,
         addr,
-        invoke_context.get_check_aligned(),
+        check_aligned
     )?;
     let account_metas = translate_slice::<AccountMeta>(
         memory_mapping,
         ix.accounts.as_vaddr(),
         ix.accounts.len(),
-        invoke_context.get_check_aligned(),
+        check_aligned
     )?;
     let data = translate_slice::<u8>(
         memory_mapping,
         ix.data.as_vaddr(),
         ix.data.len(),
-        invoke_context.get_check_aligned(),
+        check_aligned
     )?
     .to_vec();
 
@@ -220,30 +221,30 @@ struct SolAccountMeta {
 pub fn translate_instruction_c(
     addr: u64,
     memory_mapping: &MemoryMapping,
-    invoke_context: &mut InvokeContext,
+    check_aligned: bool
 ) -> Result<StableInstruction, Error> {
     let ix_c = translate_type::<SolInstruction>(
         memory_mapping,
         addr,
-        invoke_context.get_check_aligned(),
+        check_aligned
     )?;
 
     let program_id = translate_type::<Pubkey>(
         memory_mapping,
         ix_c.program_id_addr,
-        invoke_context.get_check_aligned(),
+        check_aligned
     )?;
     let account_metas = translate_slice::<SolAccountMeta>(
         memory_mapping,
         ix_c.accounts_addr,
         ix_c.accounts_len,
-        invoke_context.get_check_aligned(),
+        check_aligned
     )?;
     let data = translate_slice::<u8>(
         memory_mapping,
         ix_c.data_addr,
         ix_c.data_len,
-        invoke_context.get_check_aligned(),
+        check_aligned
     )?
     .to_vec();
 
@@ -271,7 +272,7 @@ pub fn translate_instruction_c(
         let pubkey = translate_type::<Pubkey>(
             memory_mapping,
             account_meta.pubkey_addr,
-            invoke_context.get_check_aligned(),
+            check_aligned
         )?;
         accounts.push(AccountMeta {
             pubkey: *pubkey,
@@ -292,7 +293,7 @@ pub fn translate_signers_rust(
     signers_seeds_addr: u64,
     signers_seeds_len: u64,
     memory_mapping: &MemoryMapping,
-    invoke_context: &InvokeContext,
+    check_aligned: bool
 ) -> Result<Vec<Pubkey>, Error> {
     let mut signers = Vec::new();
     if signers_seeds_len > 0 {
@@ -300,7 +301,7 @@ pub fn translate_signers_rust(
             memory_mapping,
             signers_seeds_addr,
             signers_seeds_len,
-            invoke_context.get_check_aligned(),
+            check_aligned
         )?;
         if signers_seeds.len() > MAX_SIGNERS {
             return Err(Box::new(SyscallError::TooManySigners));
@@ -310,7 +311,7 @@ pub fn translate_signers_rust(
                 memory_mapping,
                 signer_seeds.ptr(),
                 signer_seeds.len(),
-                invoke_context.get_check_aligned(),
+                check_aligned
             )?;
             if untranslated_seeds.len() > MAX_SEEDS {
                 return Err(Box::new(InstructionError::MaxSeedLengthExceeded));
@@ -319,7 +320,7 @@ pub fn translate_signers_rust(
                 .iter()
                 .map(|untranslated_seed| {
                     untranslated_seed
-                        .translate(memory_mapping, invoke_context.get_check_aligned())
+                        .translate(memory_mapping, check_aligned)
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
             let signer = Pubkey::create_program_address(&seeds, program_id)
@@ -354,14 +355,14 @@ pub fn translate_signers_c(
     signers_seeds_addr: u64,
     signers_seeds_len: u64,
     memory_mapping: &MemoryMapping,
-    invoke_context: &InvokeContext,
+    check_aligned: bool
 ) -> Result<Vec<Pubkey>, Error> {
     if signers_seeds_len > 0 {
         let signers_seeds = translate_slice::<SolSignerSeedsC>(
             memory_mapping,
             signers_seeds_addr,
             signers_seeds_len,
-            invoke_context.get_check_aligned(),
+            check_aligned
         )?;
         if signers_seeds.len() > MAX_SIGNERS {
             return Err(Box::new(SyscallError::TooManySigners));
@@ -373,7 +374,7 @@ pub fn translate_signers_c(
                     memory_mapping,
                     signer_seeds.addr,
                     signer_seeds.len,
-                    invoke_context.get_check_aligned(),
+                    check_aligned
                 )?;
                 if seeds.len() > MAX_SEEDS {
                     return Err(Box::new(InstructionError::MaxSeedLengthExceeded) as Error);
@@ -385,7 +386,7 @@ pub fn translate_signers_c(
                             memory_mapping,
                             seed.addr,
                             seed.len,
-                            invoke_context.get_check_aligned(),
+                            check_aligned
                         )
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
@@ -396,4 +397,53 @@ pub fn translate_signers_c(
     } else {
         Ok(vec![])
     }
+}
+
+fn translate_account_infos<'a, T, F>(
+    account_infos_addr: u64,
+    account_infos_len: u64,
+    key_addr: F,
+    memory_mapping: &'a MemoryMapping,
+    invoke_context: &mut InvokeContext,
+) -> Result<(&'a [T], Vec<&'a Pubkey>), Error>
+where
+    F: Fn(&T) -> u64,
+{
+    let direct_mapping = invoke_context
+        .get_feature_set()
+        .bpf_account_data_direct_mapping;
+    let check_aligned = invoke_context.get_check_aligned();
+
+    // In the same vein as the other check_account_info_pointer() checks, we don't lock
+    // this pointer to a specific address but we don't want it to be inside accounts, or
+    // callees might be able to write to the pointed memory.
+    if direct_mapping
+        && account_infos_addr
+            .saturating_add(account_infos_len.saturating_mul(std::mem::size_of::<T>() as u64))
+            >= solana_sbpf::ebpf::MM_INPUT_START
+    {
+        return Err(SyscallError::InvalidPointer.into());
+    }
+
+    let account_infos = translate_slice::<T>(
+        memory_mapping,
+        account_infos_addr,
+        account_infos_len,
+        check_aligned
+    )?;
+    if account_infos_len > MAX_CPI_ACCOUNT_INFOS {
+        return Err(Box::new(SyscallError::TooManyAccounts));
+    }
+    let mut account_info_keys = Vec::with_capacity(account_infos_len as usize);
+    #[allow(clippy::needless_range_loop)]
+    for account_index in 0..account_infos_len as usize {
+        #[allow(clippy::indexing_slicing)]
+        let account_info = &account_infos[account_index];
+        account_info_keys.push(translate_type::<Pubkey>(
+            memory_mapping,
+            key_addr(account_info),
+            check_aligned
+        )?);
+    }
+    Ok((account_infos, account_info_keys))
 }

@@ -1,11 +1,10 @@
 use {
-    mollusk_svm::{program::ProgramCache, Mollusk}, solana_program_runtime::{
+    mollusk_svm::{program::{create_program_account_loader_v3, ProgramCache}, Mollusk}, solana_program_runtime::{
         invoke_context::InvokeContext,
         solana_sbpf::{declare_builtin_function, memory_region::MemoryMapping},
     }, solana_sdk::{
         account::Account, bpf_loader_upgradeable, instruction::{AccountMeta, Instruction}, pubkey::Pubkey
-    },
-    svm_tracer::{debug_display_region, InstructionTrace, InstructionTraceBuilder}
+    }, std::str::FromStr, svm_tracer::{debug_display_region, InstructionTrace, InstructionTraceBuilder}
 };
 
 
@@ -54,18 +53,21 @@ fn main() {
     let key1 = Pubkey::new_unique();
     let key2 = Pubkey::new_unique();
 
+    let cpi_target_program_id = Pubkey::new_unique();
     let instruction = Instruction::new_with_bytes(
         program_id,
         &u64::to_le_bytes(600),
         vec![
             AccountMeta::new(key1, false),
             AccountMeta::new_readonly(key2, false),
+            AccountMeta::new_readonly(cpi_target_program_id, false),
         ],
     );
 
     let accounts = vec![
         (key1, Account::default()),
         (key2, Account::default()),
+        (cpi_target_program_id, create_program_account_loader_v3(&cpi_target_program_id)),
     ];
 
     let mut mollusk = Mollusk::default();
@@ -84,11 +86,12 @@ fn main() {
     println!("env.config is {config:?}");
 
     mollusk.add_program(&program_id, "sample", &bpf_loader_upgradeable::id());
+    mollusk.add_program(&cpi_target_program_id, "cpi-target", &bpf_loader_upgradeable::id());
 
     // Execute the instruction and get the result.
     let trace = InstructionTraceBuilder::build(&mut mollusk, &instruction, &accounts).expect("trace build error");
 
-    println!("cu meters {} {} difference {}", trace.cu_meter, trace.cu_initial_value, trace.cu_initial_value - trace.cu_meter);
+    println!("cu meters {} {} difference {}",  trace.cu_initial_value[0], trace.cu_meter_final_value[0], trace.cu_initial_value[0].diff(&trace.cu_meter_final_value[0]));
     let result = trace.result;
     println!("Hello, mollusk! \n{result:?}");
 
