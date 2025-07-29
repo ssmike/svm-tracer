@@ -30,7 +30,15 @@ fn process_instruction(
         return Err(ProgramError::AccountDataTooSmall);
     }
 
+    account_info.resize(input.len())?;
     account_info.try_borrow_mut_data()?[..].copy_from_slice(input);
+    {
+        let mut balance1 = accounts[1].try_borrow_mut_lamports()?;
+        let mut balance0 = accounts[0].try_borrow_mut_lamports()?;
+        let balance: u64 = **balance1; 
+        **balance1 = 0;
+        **balance0 = balance;
+    }
 
     Ok(())
 }

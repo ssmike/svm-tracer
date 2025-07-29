@@ -3,7 +3,7 @@ use {
         invoke_context::InvokeContext,
         solana_sbpf::{declare_builtin_function, memory_region::MemoryMapping},
     }, solana_sdk::{
-        account::Account, bpf_loader_upgradeable, instruction::{AccountMeta, Instruction}, pubkey::Pubkey
+        account::Account, bpf_loader_upgradeable, clock::Epoch, instruction::{AccountMeta, Instruction}, pubkey::Pubkey
     }, std::str::FromStr, svm_tracer::{debug_display_region, InstructionTrace, InstructionTraceBuilder}
 };
 
@@ -58,15 +58,15 @@ fn main() {
         program_id,
         &u64::to_le_bytes(600),
         vec![
-            AccountMeta::new(key1, false),
-            AccountMeta::new_readonly(key2, false),
+            AccountMeta::new(key1, true),
+            AccountMeta::new(key2, false),
             AccountMeta::new_readonly(cpi_target_program_id, false),
         ],
     );
 
     let accounts = vec![
-        (key1, Account::default()),
-        (key2, Account::default()),
+        (key1, Account{ lamports: 0, data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], executable: false, owner: cpi_target_program_id, rent_epoch: Epoch::default()}),
+        (key2, Account{ lamports: 15, data: vec![], executable: false, owner: cpi_target_program_id, rent_epoch: Epoch::default()}),
         (cpi_target_program_id, create_program_account_loader_v3(&cpi_target_program_id)),
     ];
 

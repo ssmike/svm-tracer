@@ -30,13 +30,26 @@ fn process_instruction(
     }
     let value = fibs.last().unwrap() % 7;
 
-    // Call the custom syscall to burn CUs.
     unsafe {
         sol_inspect(fibs.last().unwrap() % 7);
-        //sol_burn_cus();
     }
 
-    invoke(&Instruction::new_with_bytes(*accounts[2].key, &[], vec![AccountMeta::new(*accounts[0].key, false), AccountMeta::new_readonly(*accounts[1].key, false)]), accounts);
+    assert!(**accounts[0].lamports.try_borrow().unwrap() == 0);
+    invoke(&Instruction::new_with_bytes(*accounts[2].key, input, vec![AccountMeta::new(*accounts[0].key, true), AccountMeta::new(*accounts[1].key, false)]), accounts)?;
+
+    {
+        let mut r: u64 = **accounts[0].lamports.try_borrow().unwrap();
+        assert!(r == 15);
+        let slice_ref = accounts[0].try_borrow_data()?;
+        for byte in slice_ref.iter() {
+            r = r.saturating_add(*byte as u64);
+        }
+
+        unsafe {
+            sol_inspect(r as u64);
+        }
+    }
+
 
     Ok(())
 }

@@ -16,3 +16,4 @@ solana-account = {workspace = true }
 solana-bpf-loader-program = {workspace = true }
 solana-stable-layout = {workspace = true }
 log.workspace = true
+solana-account-info.workspace = true

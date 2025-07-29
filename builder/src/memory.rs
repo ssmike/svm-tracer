@@ -1,6 +1,9 @@
+use std::fmt::Debug;
+
 use crate::error::EmulationError;
 use solana_program_runtime::{solana_sbpf::{ebpf::HOST_ALIGN, aligned_memory::{Pod, AlignedMemory}, memory_region::MemoryRegion}, invoke_context::SerializedAccountMetadata};
 use solana_pubkey::Pubkey;
+use log::debug;
 
 #[derive(Debug, Default)]
 pub struct AddressSpace {
@@ -33,11 +36,20 @@ pub struct Patch<T> {
     pub val: T
 }
 
+#[derive(Debug, Clone)]
+pub struct MemRegionPatch {
+    pub vmaddr: u64,
+    pub mem: Vec<u8>
+}
+
+#[derive(Debug, Clone)]
 pub struct AccountInfoPatch {
-    pub key: Pubkey,
     pub lamports_patch: Patch<u64>,
     pub owner_patch: Patch<Pubkey>,
-    pub data_lent_patch: Patch<u64>,
+    pub data_len_patch: Option<Patch<u64>>,
+    pub data_ptr_patch: Option<Patch<u64>>,
+    pub data_slice_patch: Option<Patch<[u64; 2]>>,
+    pub mem_region_patch: MemRegionPatch,
 }
 
 impl AddressSpace {
@@ -93,6 +105,20 @@ impl AddressSpace {
         };
 
         Ok(())
+    }
+
+    pub fn apply_patch<T: Debug>(&mut self, op: Patch<T>) -> Result<(), EmulationError> {
+        debug!("applying {op:?}");
+        let phy_addr = self.translate_vmaddr(op.vmaddr, std::mem::size_of::<T>() as u64, None)?;
+        unsafe { std::ptr::write_unaligned::<T>(phy_addr as *mut T, op.val) };
+        Ok(())
+    }
+
+    pub fn override_region(&mut self, patch: &MemRegionPatch) {
+        let mut mem = AlignedMemory::<{HOST_ALIGN}>::from_slice(patch.mem.as_slice());
+        let region = MemoryRegion::new_writable(mem.as_slice_mut(), patch.vmaddr);
+        self.mem.push(mem);
+        self.regions.push(region);
     }
 }
 

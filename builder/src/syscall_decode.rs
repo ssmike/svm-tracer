@@ -1,10 +1,10 @@
 use {
     super::*,
-    //solana_bpf_loader_program::{translate_inner, translate_slice_inner, translate_type_inner},
     solana_bpf_loader_program::syscalls::{SyscallError,VmSlice},
     solana_sbpf::memory_region::AccessType,
     solana_stable_layout::stable_instruction::StableInstruction,
     //std::{mem, ptr},
+    solana_account_info::AccountInfo,
 };
 
 type Error = Box<dyn std::error::Error>;
@@ -397,6 +397,287 @@ pub fn translate_signers_c(
     } else {
         Ok(vec![])
     }
+}
+
+/// Rust representation of C's SolAccountInfo
+#[derive(Debug)]
+#[repr(C)]
+struct SolAccountInfo {
+    key_addr: u64,
+    lamports_addr: u64,
+    data_len: u64,
+    data_addr: u64,
+    owner_addr: u64,
+    rent_epoch: u64,
+    is_signer: bool,
+    is_writable: bool,
+    executable: bool,
+}
+
+pub fn make_account_patch_rust<'a>(
+    pubkey: Pubkey,
+    account_infos_addr: u64,
+    account_infos_len: u64,
+    regions: &[(Pubkey, VmRegion)],
+    memory_mapping: &'a MemoryMapping,
+    invoke_context: &mut InvokeContext,
+) -> Result<crate::memory::AccountInfoPatch, Error>
+{
+    make_account_patch::<AccountInfo, ParseRustAccInfo>(
+        pubkey,
+        account_infos_addr,
+        account_infos_len,
+        ParseRustAccInfo::default(),
+        regions,
+        memory_mapping,
+        invoke_context)
+}
+
+pub fn make_account_patch_c<'a>(
+    pubkey: Pubkey,
+    account_infos_addr: u64,
+    account_infos_len: u64,
+    regions: &[(Pubkey, VmRegion)],
+    memory_mapping: &'a MemoryMapping,
+    invoke_context: &mut InvokeContext,
+) -> Result<crate::memory::AccountInfoPatch, Error>
+{
+    make_account_patch::<SolAccountInfo, ParseSolAccInfo>(
+        pubkey,
+        account_infos_addr,
+        account_infos_len,
+        ParseSolAccInfo::default(),
+        regions,
+        memory_mapping,
+        invoke_context)
+}
+
+pub struct VmRegion {
+    start: u64,
+    len: u64
+}
+
+trait ParseAccInfo {
+    type Info;
+
+    fn key_addr(info: &Self::Info) -> u64;
+
+    fn lamports(info: &Self::Info, memory_mapping: &MemoryMapping, check_aligned: bool) -> Result<Patch<u64>, Error>;
+
+    fn owner(info: &Self::Info, memory_mapping: &MemoryMapping, check_aligned: bool) -> Result<Patch<Pubkey>, Error>;
+
+    fn data_region_start(info: &Self::Info, vmaddr: u64) -> Result<Option<Patch<u64>>, Error>;
+
+    fn data_region_len(info: &Self::Info, vmaddr: u64) -> Result<Option<Patch<u64>>, Error>;
+
+    fn data_region_repr(info: &Self::Info, memory_mapping: &MemoryMapping, check_aligned: bool) -> Result<Option<Patch<[u64; 2]>>, Error>;
+
+    fn data_region(info: &Self::Info, memory_mapping: &MemoryMapping, check_aligned: bool) -> Result<VmRegion, Error>;
+}
+
+#[derive(Default)]
+struct ParseRustAccInfo<'a> {
+    marker: std::marker::PhantomData<AccountInfo<'a>>
+}
+
+impl<'a> ParseAccInfo for ParseRustAccInfo<'a> {
+    type Info = AccountInfo<'a>;
+
+    fn key_addr(info: &Self::Info) -> u64 {
+        info.key as *const _ as u64
+    }
+
+    fn lamports(info: &Self::Info, memory_mapping: &MemoryMapping, check_aligned: bool) -> Result<Patch<u64>, Error> {
+        let vmaddr = info.lamports.as_ptr() as u64;
+        let vmaddr = *translate_type::<u64>(memory_mapping, vmaddr, check_aligned)?;
+        Ok(Patch{ vmaddr, val: *translate_type::<u64>(memory_mapping, vmaddr, check_aligned)? })
+    }
+
+    fn owner(info: &Self::Info, memory_mapping: &MemoryMapping, check_aligned: bool) -> Result<Patch<Pubkey>, Error> {
+        let vmaddr = info.owner as *const _ as u64;
+        Ok(Patch { vmaddr, val: *translate_type(memory_mapping, vmaddr, check_aligned)? })
+    }
+
+    fn data_region_len(_: &Self::Info, _: u64) -> Result<Option<Patch<u64>>, Error> {
+        Ok(None)
+    }
+
+    fn data_region_start(_: &Self::Info, _: u64) -> Result<Option<Patch<u64>>, Error> {
+        Ok(None)
+    }
+
+    fn data_region_repr(info: &Self::Info, memory_mapping: &MemoryMapping, check_aligned: bool) -> Result<Option<Patch<[u64; 2]>>, Error> {
+        let data_ptr = info.data.as_ptr() as *const _ as u64;
+        let data = translate_type::<&[u8]>(
+            memory_mapping,
+            info.data.as_ptr() as *const _ as u64,
+            check_aligned
+        )?;
+        Ok(Some(Patch {vmaddr: data_ptr as u64, val: unsafe { std::mem::transmute(*data)} }))
+    }
+
+    fn data_region(account_info: &Self::Info, memory_mapping: &MemoryMapping, check_aligned: bool) -> Result<VmRegion, Error> {
+        let data = *translate_type::<&[u8]>(
+            memory_mapping,
+            account_info.data.as_ptr() as *const _ as u64,
+            check_aligned
+        )?;
+
+        Ok(VmRegion {
+            start: data.as_ptr() as u64,
+            len: data.len() as u64
+        })
+    }
+}
+
+#[derive(Default)]
+struct ParseSolAccInfo {}
+
+impl ParseAccInfo for ParseSolAccInfo {
+    type Info = SolAccountInfo;
+
+    fn key_addr(info: &Self::Info) -> u64 {
+        info.key_addr
+    }
+
+    fn lamports(info: &Self::Info, memory_mapping: &MemoryMapping, check_aligned: bool) -> Result<Patch<u64>, Error> {
+        let vmaddr = info.lamports_addr;
+        Ok(Patch{ vmaddr, val: *translate_type::<u64>(memory_mapping, vmaddr, check_aligned)? })
+    }
+
+    fn owner(info: &Self::Info, memory_mapping: &MemoryMapping, check_aligned: bool) -> Result<Patch<Pubkey>, Error> {
+        let vmaddr = info.owner_addr;
+        Ok(Patch{ vmaddr, val: *translate_type::<Pubkey>(memory_mapping, vmaddr, check_aligned)? })
+    }
+
+    fn data_region_repr(_: &Self::Info, _: &MemoryMapping, _: bool) -> Result<Option<Patch<[u64; 2]>>, Error> {
+        Ok(None)
+    }
+
+    fn data_region_start(info: &Self::Info, vm_addr: u64) -> Result<Option<Patch<u64>>, Error> {
+        let vmaddr = vm_addr.saturating_add(std::mem::offset_of!(Self::Info, data_addr) as u64);
+        Ok(Some(Patch{vmaddr, val: info.data_addr as u64}))
+
+    }
+
+    fn data_region_len(info: &Self::Info, vmaddr: u64) -> Result<Option<Patch<u64>>, Error> {
+        let vmaddr = vmaddr.saturating_add(std::mem::offset_of!(Self::Info, data_len) as u64);
+        Ok(Some(Patch{vmaddr, val: info.data_len }))
+    }
+
+    fn data_region(info: &Self::Info, _: &MemoryMapping, _: bool) -> Result<VmRegion, Error> {
+        Ok(VmRegion { start: info.data_addr, len: info.data_len })
+    }
+}
+
+fn make_account_patch<'a, T, Parse>(
+    pubkey: Pubkey,
+    account_infos_addr: u64,
+    account_infos_len: u64,
+    _: Parse,
+    regions: &[(Pubkey, VmRegion)],
+    memory_mapping: &'a MemoryMapping,
+    invoke_context: &mut InvokeContext,
+) -> Result<crate::memory::AccountInfoPatch, Error>
+where
+    Parse: ParseAccInfo
+{
+    let (infos, keys) = translate_account_infos(
+        account_infos_addr,
+        account_infos_len,
+        Parse::key_addr,
+        memory_mapping,
+        invoke_context)?;
+
+    let check_aligned = invoke_context.get_check_aligned();
+    
+    assert!(account_infos_len as usize == regions.len());
+
+    for i in 0..account_infos_len {
+        let i = i as usize;
+        let (key, region_before) = &regions[i];
+        if pubkey == *key {
+            assert!(pubkey == *keys[i]);
+            let info = &infos[i];
+            let vmaddr = account_infos_addr.saturating_add(
+                i.saturating_mul(mem::size_of::<T>()) as u64);
+
+            let region_after = Parse::data_region(info, memory_mapping, check_aligned)?;
+            assert!(region_before.start == region_after.start);
+            let mut mem = translate_slice::<u8>(memory_mapping, region_after.start, region_after.len, check_aligned)?.to_vec();
+            if region_after.len < region_before.len {
+                mem.extend(std::iter::repeat_n(0_u8, (region_before.len - region_after.len) as usize));
+            }
+
+            return Ok(crate::memory::AccountInfoPatch {
+                lamports_patch: Parse::lamports(info, memory_mapping, check_aligned)?,
+                owner_patch: Parse::owner(info, memory_mapping, check_aligned)?,
+                data_slice_patch: Parse::data_region_repr(info, memory_mapping, check_aligned)?,
+                data_len_patch: Parse::data_region_len(info, vmaddr)?,
+                data_ptr_patch: Parse::data_region_start(info, vmaddr)?,
+                mem_region_patch: MemRegionPatch {vmaddr: region_after.start, mem}
+            })
+        }
+    }
+
+    panic!("unmatched pubkey in cpi call")
+}
+
+pub fn translate_regions_rust<'a>(
+    account_infos_addr: u64,
+    account_infos_len: u64,
+    memory_mapping: &'a MemoryMapping,
+    invoke_context: &mut InvokeContext,
+) -> Result<Vec<(Pubkey, VmRegion)>, Error>
+{
+    translate_regions::<AccountInfo, ParseRustAccInfo>(
+        account_infos_addr,
+        account_infos_len,
+        ParseRustAccInfo::default(),
+        memory_mapping,
+        invoke_context)
+}
+
+pub fn translate_regions_c<'a>(
+    account_infos_addr: u64,
+    account_infos_len: u64,
+    memory_mapping: &'a MemoryMapping,
+    invoke_context: &mut InvokeContext,
+) -> Result<Vec<(Pubkey, VmRegion)>, Error>
+{
+    translate_regions::<SolAccountInfo, ParseSolAccInfo>(
+        account_infos_addr,
+        account_infos_len,
+        ParseSolAccInfo::default(),
+        memory_mapping,
+        invoke_context)
+}
+
+fn translate_regions<'a, T, Parse>(
+    account_infos_addr: u64,
+    account_infos_len: u64,
+    _: Parse,
+    memory_mapping: &'a MemoryMapping,
+    invoke_context: &mut InvokeContext,
+) -> Result<Vec<(Pubkey, VmRegion)>, Error>
+where
+    Parse: ParseAccInfo
+{
+    let (infos, keys) = translate_account_infos(
+        account_infos_addr,
+        account_infos_len,
+        Parse::key_addr,
+        memory_mapping,
+        invoke_context)?;
+
+    let check_aligned = invoke_context.get_check_aligned();
+    let mut regions = Vec::<(Pubkey, VmRegion)>::new();
+    for i in 0..account_infos_len {
+        let i = i as usize;
+        regions.push((*keys[i], Parse::data_region(&infos[i], memory_mapping, check_aligned)?));
+    }
+
+    Ok(regions)
 }
 
 fn translate_account_infos<'a, T, F>(

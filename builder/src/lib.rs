@@ -23,7 +23,6 @@ pub mod memory;
 use memory::*;
 
 mod syscall_decode;
-use syscall_decode::{translate_signers_c, translate_instruction_c, translate_signers_rust, translate_instruction_rust};
 
 #[derive(Debug, Clone)]
 pub enum CPIKind {
@@ -43,6 +42,8 @@ pub struct CPIEntry {
 
     pub cu_meter_before: CuMeter,
     pub cu_meter_after: CuMeter,
+
+    pub acc_patches: Vec<(Pubkey, AccountInfoPatch)>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,8 +122,9 @@ impl TraceEntry {
                     let value = $value as $typ as u64;
                     let vmaddr = $vmaddr;
                     mem = Some(MemoryAccess::Read{size: len as u8, value, vmaddr:vmaddr});
-                    if address_space.load::<$typ>(vmaddr)? != value {
-                        return Err(EmulationError::MemoryConsistencyCheck{vmaddr, value: value as u64});
+                    let found = address_space.load::<$typ>(vmaddr)?;
+                    if found != value {
+                        return Err(EmulationError::MemoryConsistencyCheck{vmaddr, expected: value as u64, found});
                     }
                 }
             }
@@ -278,7 +280,10 @@ impl mollusk_svm::InvocationInspectCallback for InstructionTraceBuilder {
             invoke_context: &InvokeContext,
         ) {
         match self.trace.borrow_mut().as_mut().unwrap().prepare(program_id, instruction_data, instruction_accounts, invoke_context) {
-            Err(err) => { self.err.replace(Some(EmulationError::InstructionError(err))); },
+            Err(err) => {
+                TRACE_IN_PROGRESS.with(|addr| addr.replace(std::ptr::null_mut()));
+                self.err.replace(Some(EmulationError::InstructionError(err)));
+            },
             _ => {}
         };
     }
@@ -286,8 +291,8 @@ impl mollusk_svm::InvocationInspectCallback for InstructionTraceBuilder {
     fn after_invocation(&self, invoke_context: &InvokeContext) {
         if RefCell::borrow(&self.err).borrow().is_none() {
            match self.trace.borrow_mut().as_mut().unwrap().finalize_frame(invoke_context) {
-            Err(err) => { self.err.replace(Some(err)); },
-            _ => {}
+               Err(err) => { self.err.replace(Some(err)); },
+               _ => {}
            }
         }
     }
@@ -297,8 +302,8 @@ thread_local! {
     static TRACE_IN_PROGRESS: RefCell<*mut InstructionTrace> = RefCell::new(std::ptr::null_mut());
 }
 
-macro_rules! instr_invoke_syscall_stub {
-    ($name:ident, $syscall:ident, $translate_instruction:ident, $translate_signers:ident, $kind:expr) => {
+macro_rules! invoke_syscall_stub {
+    ($name:ident, $syscall:ident, $translate_instruction:path, $translate_signers:path, $translate_regions:path, $make_account_patch:path, $kind:expr) => {
         declare_builtin_function!(
             $name,
             fn rust(
@@ -342,7 +347,8 @@ macro_rules! instr_invoke_syscall_stub {
                                                 callee_frame: 0,
                                                 cu_meter_before: meter.into(),
                                                 cu_meter_after: meter.into(),
-                                                return_data: vec![]
+                                                return_data: vec![],
+                                                acc_patches: vec![],
                                             });
                                     });
                             }
@@ -353,6 +359,7 @@ macro_rules! instr_invoke_syscall_stub {
                 }
 
                 let instruction = check_call!($translate_instruction(instruction_addr, memory_mapping, check_aligned));
+                let regions = check_call!($translate_regions(account_infos_addr, account_infos_len, memory_mapping, invoke_context));
 
                 let transaction_context = &invoke_context.transaction_context;
                 let instruction_context = check_call!(transaction_context.get_current_instruction_context());
@@ -384,7 +391,8 @@ macro_rules! instr_invoke_syscall_stub {
                             callee_frame: 0,
                             cu_meter_before: meter.into(),
                             cu_meter_after: meter.into(),
-                            return_data: vec![]
+                            return_data: vec![],
+                            acc_patches: vec![],
                         });
 
                     trace.prepare(
@@ -405,11 +413,28 @@ macro_rules! instr_invoke_syscall_stub {
 
                 TRACE_IN_PROGRESS.with_borrow_mut(|trace| {
                     let trace: &mut InstructionTrace = unsafe{&mut (**trace)};
-                    trace.cpi_calls[cpi_number].callee_frame = frame_number;
-                    let result = trace.finalize_frame(invoke_context);
-                    let meter = solana_sbpf::vm::ContextObject::get_remaining(invoke_context);
-                    trace.cpi_calls[cpi_number].cu_meter_after = meter.into();
-                    result
+                    {
+                        let cpi_entry = &mut trace.cpi_calls[cpi_number];
+                        for account in instruction.accounts.as_ref() {
+                            if account.is_writable {
+                                debug!("adding patch for {}", account.pubkey);
+                                cpi_entry.acc_patches.push((account.pubkey,
+                                        $make_account_patch(
+                                            account.pubkey,
+                                            account_infos_addr,
+                                            account_infos_len,
+                                            regions.as_slice(),
+                                            memory_mapping,
+                                            invoke_context)?));
+                            }
+                        }
+
+                        let meter = solana_sbpf::vm::ContextObject::get_remaining(invoke_context);
+                        cpi_entry.cu_meter_after = meter.into();
+                        cpi_entry.callee_frame = frame_number;
+                    }
+
+                    trace.finalize_frame(invoke_context)
                 })?;
 
                 result
@@ -419,18 +444,22 @@ macro_rules! instr_invoke_syscall_stub {
     };
 }
 
-instr_invoke_syscall_stub!(
+invoke_syscall_stub!(
     SyscallInvokeSignedCStub,
     SyscallInvokeSignedC,
-    translate_instruction_c,
-    translate_signers_c,
+    syscall_decode::translate_instruction_c,
+    syscall_decode::translate_signers_c,
+    syscall_decode::translate_regions_c,
+    syscall_decode::make_account_patch_c,
     CPIKind::C);
 
-instr_invoke_syscall_stub!(
+invoke_syscall_stub!(
     SyscallInvokeSignedRustStub,
     SyscallInvokeSignedRust,
-    translate_instruction_rust,
-    translate_signers_rust,
+    syscall_decode::translate_instruction_rust,
+    syscall_decode::translate_signers_rust,
+    syscall_decode::translate_regions_rust,
+    syscall_decode::make_account_patch_rust,
     CPIKind::Rust);
 
 impl Default for InstructionTrace {
@@ -668,6 +697,20 @@ impl InstructionTrace {
                 consume_mem_op!(n);
             }
             SysCall::CPI(cpi_entry) => {
+                for (_, patch) in cpi_entry.acc_patches.as_slice() {
+                    address_space.apply_patch(patch.lamports_patch.clone())?;
+                    address_space.apply_patch(patch.owner_patch.clone())?;
+                    if let Some(ref patch) = patch.data_len_patch {
+                        address_space.apply_patch(patch.clone())?;
+                    }
+                    if let Some(ref patch) = patch.data_ptr_patch {
+                        address_space.apply_patch(patch.clone())?;
+                    }
+                    if let Some(ref patch) = patch.data_slice_patch {
+                        address_space.apply_patch(patch.clone())?;
+                    }
+                    address_space.override_region(&patch.mem_region_patch);
+                }
                 *cu_meter = cpi_entry.cu_meter_after.clone();
             },
             SysCall::Unknown(name) => {
