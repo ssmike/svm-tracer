@@ -7,13 +7,14 @@ use {
     solana_account::Account,
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_instruction::{AccountMeta, Instruction, error::InstructionError},
-    solana_program_runtime::{solana_sbpf::{aligned_memory::{AlignedMemory, Pod}, program::BuiltinProgram}, invoke_context::{InvokeContext, SerializedAccountMetadata},
+    solana_program_runtime::{solana_sbpf::{aligned_memory::AlignedMemory, program::BuiltinProgram}, invoke_context::InvokeContext,
     loaded_programs::ProgramCacheEntryOwner, serialization::serialize_parameters, solana_sbpf::{self, declare_builtin_function, memory_region::{MemoryMapping, MemoryRegion}}},
     solana_pubkey::Pubkey,
-    solana_transaction_context::{InstructionAccount, InstructionContext, IndexOfAccount},
+    solana_transaction_context::{InstructionAccount, InstructionContext},
     solana_bpf_loader_program::{calculate_heap_cost, syscalls::{SyscallInvokeSignedC, SyscallInvokeSignedRust}},
     std::{cell::RefCell, rc::Rc, borrow::Borrow},
     log::{debug,error},
+    solana_compute_budget::compute_budget::SVMTransactionExecutionCost
 };
 
 pub mod error;
@@ -517,6 +518,62 @@ impl std::fmt::Display for CuMeter {
     }
 }
 
+pub fn replay_syscall(cost: &SVMTransactionExecutionCost, cu_meter: &mut CuMeter, address_space: &mut AddressSpace, op: &SysCall) -> Result<(), EmulationError> {
+    macro_rules! consume_mem_op {
+        ($n: expr) => {
+
+            cu_meter.consume_cu(cost.mem_op_base_cost.max(
+                $n.checked_div(cost.cpi_bytes_per_unit)
+                    .unwrap_or(u64::MAX)));
+        }
+    }
+
+    debug!("replaying {op:?}");
+    match op {
+        SysCall::MemCpy { dst, src, n} => {
+            for i in 0..*n {
+                address_space.store::<u8>(dst + i, address_space.load::<u8>(src + i)? as u8)?;
+            }
+            consume_mem_op!(n);
+        },
+        SysCall::MemCmp { s1, s2, n, result } => {
+            let mut cmpresult: i32 = 0;
+            for i in 0..*n as usize {
+                let i = i as u64;
+                let a = address_space.load::<u8>(*s1 + i)?;
+                let b = address_space.load::<u8>(*s2 + i)?;
+                if a != b {
+                    cmpresult = (a as i32).saturating_sub(b as i32);
+                    break;
+                };
+            }
+            address_space.store(*result, cmpresult)?;
+            consume_mem_op!(n);
+        }
+        SysCall::CPI(cpi_entry) => {
+            for (_, patch) in cpi_entry.acc_patches.as_slice() {
+                address_space.apply_patch(patch.lamports_patch.clone())?;
+                address_space.apply_patch(patch.owner_patch.clone())?;
+                if let Some(ref patch) = patch.data_len_patch {
+                    address_space.apply_patch(patch.clone())?;
+                }
+                if let Some(ref patch) = patch.data_ptr_patch {
+                    address_space.apply_patch(patch.clone())?;
+                }
+                if let Some(ref patch) = patch.data_slice_patch {
+                    address_space.apply_patch(patch.clone())?;
+                }
+                address_space.override_region(&patch.mem_region_patch);
+            }
+            *cu_meter = cpi_entry.cu_meter_after.clone();
+        },
+        SysCall::Unknown(name) => {
+            error!("unhandled syscall {name}");
+        }
+    }
+
+    Ok(())
+}
 
 impl InstructionTrace {
     fn configure(&mut self, mollusk: &Mollusk) {
@@ -663,64 +720,6 @@ impl InstructionTrace {
         Ok(self.cur_frame)
     }
 
-    fn replay_syscall(&mut self, cu_meter: &mut CuMeter, address_space: &mut AddressSpace, op: &SysCall) -> Result<(), EmulationError> {
-        let cost = self.compute_budget.to_cost();
-        macro_rules! consume_mem_op {
-            ($n: expr) => {
-
-                cu_meter.consume_cu(cost.mem_op_base_cost.max(
-                    $n.checked_div(cost.cpi_bytes_per_unit)
-                        .unwrap_or(u64::MAX)));
-            }
-        }
-
-        debug!("replaying {op:?}");
-        match op {
-            SysCall::MemCpy { dst, src, n} => {
-                for i in 0..*n {
-                    address_space.store::<u8>(dst + i, address_space.load::<u8>(src + i)? as u8)?;
-                }
-                consume_mem_op!(n);
-            },
-            SysCall::MemCmp { s1, s2, n, result } => {
-                let mut cmpresult: i32 = 0;
-                for i in 0..*n as usize {
-                    let i = i as u64;
-                    let a = address_space.load::<u8>(*s1 + i)?;
-                    let b = address_space.load::<u8>(*s2 + i)?;
-                    if a != b {
-                        cmpresult = (a as i32).saturating_sub(b as i32);
-                        break;
-                    };
-                }
-                address_space.store(*result, cmpresult)?;
-                consume_mem_op!(n);
-            }
-            SysCall::CPI(cpi_entry) => {
-                for (_, patch) in cpi_entry.acc_patches.as_slice() {
-                    address_space.apply_patch(patch.lamports_patch.clone())?;
-                    address_space.apply_patch(patch.owner_patch.clone())?;
-                    if let Some(ref patch) = patch.data_len_patch {
-                        address_space.apply_patch(patch.clone())?;
-                    }
-                    if let Some(ref patch) = patch.data_ptr_patch {
-                        address_space.apply_patch(patch.clone())?;
-                    }
-                    if let Some(ref patch) = patch.data_slice_patch {
-                        address_space.apply_patch(patch.clone())?;
-                    }
-                    address_space.override_region(&patch.mem_region_patch);
-                }
-                *cu_meter = cpi_entry.cu_meter_after.clone();
-            },
-            SysCall::Unknown(name) => {
-                error!("unhandled syscall {name}");
-            }
-        }
-        
-        Ok(())
-    }
-
     fn finalize_frame(&mut self, ctx: &InvokeContext) -> Result<(), EmulationError> {
         let frame_number = self.cur_frame;
         let mut cu_meter = self.cu_initial_value[frame_number].clone();
@@ -733,6 +732,7 @@ impl InstructionTrace {
         let mut address_space = self.address_space[frame_number].clone();
         let mut cpi_entries = self.cpi_calls.clone().into_iter().filter(|x| x.caller_frame == frame_number);
 
+        let cost = self.compute_budget.to_cost();
         for i in 0..self.entries[frame_number].len() {
             let cu_before = cu_meter.clone();
             cu_meter.consume_cu(1);
@@ -773,7 +773,7 @@ impl InstructionTrace {
                 address_space.replay(op.clone())?;
             }
             if let Some(ref syscall) = &cur.syscall {
-                self.replay_syscall(&mut cu_meter, &mut address_space, syscall)?;
+                replay_syscall(&cost, &mut cu_meter, &mut address_space, syscall)?;
             }
         }
         assert!(cpi_entries.next().is_none());
