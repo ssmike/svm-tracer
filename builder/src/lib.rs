@@ -41,8 +41,8 @@ pub struct CPIEntry {
     pub callee_frame: usize,
     pub caller_frame: usize,
 
-    pub cu_meter_before: CuMeter,
-    pub cu_meter_after: CuMeter,
+    pub cu_meter_before: CUMeter,
+    pub cu_meter_after: CUMeter,
 
     pub acc_patches: Vec<(Pubkey, AccountInfoPatch)>,
 }
@@ -56,7 +56,7 @@ pub enum SysCall {
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
-pub struct CuMeter(u64);
+pub struct CUMeter(u64);
 
 #[derive(Debug, Clone)]
 pub struct TraceEntry {
@@ -67,9 +67,9 @@ pub struct TraceEntry {
     pub mem: Option<MemoryAccess>,
     pub syscall: Option<SysCall>,
 
-    pub cu_meter_before: CuMeter,
+    pub cu_meter_before: CUMeter,
     // after execution
-    pub cu_meter: CuMeter
+    pub cu_meter: CUMeter
 }
 
 #[derive(Debug, Default)]
@@ -90,8 +90,8 @@ pub struct InstructionTrace {
 
     registered_syscalls: BTreeMap<u32, String>,
 
-    pub cu_meter_final_value: Vec<CuMeter>,
-    pub cu_initial_value: Vec<CuMeter>,
+    pub cu_meter_final_value: Vec<CUMeter>,
+    pub cu_initial_value: Vec<CUMeter>,
 
     pub cpi_calls: Vec<CPIEntry>,
 
@@ -490,35 +490,35 @@ pub fn debug_display_region(display: &str, r: &MemoryRegion) {
 }
 
 
-impl CuMeter {
+impl CUMeter {
     fn consume_cu(&mut self, value: u64) {
         self.0 = self.0.saturating_sub(value);
     }
 
-    pub fn diff(&self, cu_meter: &CuMeter) -> u64 {
+    pub fn diff(&self, cu_meter: &CUMeter) -> u64 {
         self.0.saturating_sub(cu_meter.0)
     }
 }    
 
-impl From<u64> for CuMeter {
+impl From<u64> for CUMeter {
     fn from(value: u64) -> Self {
         Self(value)
     }
 }
 
-impl Into<u64> for CuMeter {
+impl Into<u64> for CUMeter {
     fn into(self) -> u64 {
         self.0
     }
 }
 
-impl std::fmt::Display for CuMeter {
+impl std::fmt::Display for CUMeter {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
         write!(f, "cu meter ({})", self.0)
     }
 }
 
-pub fn replay_syscall(cost: &SVMTransactionExecutionCost, cu_meter: &mut CuMeter, address_space: &mut AddressSpace, op: &SysCall) -> Result<(), EmulationError> {
+pub fn replay_syscall(cost: &SVMTransactionExecutionCost, cu_meter: &mut CUMeter, address_space: &mut AddressSpace, op: &SysCall) -> Result<(), EmulationError> {
     macro_rules! consume_mem_op {
         ($n: expr) => {
 
