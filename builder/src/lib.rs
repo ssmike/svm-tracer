@@ -79,28 +79,32 @@ pub struct InstructionConf {
 }
 
 #[derive(Debug)]
+pub struct InstructionFrame {
+    pub instruction: Instruction,
+
+    pub entries: Vec<TraceEntry>,
+    pub address_space: AddressSpace,
+    pub conf: InstructionConf,
+
+    pub cu_meter_final_value: CUMeter,
+    pub cu_meter_initial_value: CUMeter,
+}
+
+#[derive(Debug)]
 pub struct InstructionTrace {
-    pub entries: Vec<Vec<TraceEntry>>,
-    pub address_space: Vec<AddressSpace>,
+    pub frames: Vec<InstructionFrame>,
     pub result: InstructionResult,
-    pub conf: Vec<InstructionConf>,
 
     feature_set: FeatureSet,
     compute_budget: ComputeBudget,
 
     registered_syscalls: BTreeMap<u32, String>,
 
-    pub cu_meter_final_value: Vec<CUMeter>,
-    pub cu_initial_value: Vec<CUMeter>,
-
     pub cpi_calls: Vec<CPIEntry>,
 
     cpi_caller: Vec<usize>,
     cur_frame: usize,
-    tx_context_keys: Vec<Pubkey>,
-
-    pub return_data: BTreeMap<Pubkey, Vec<u8>>,
-    pub instructions: Vec<Instruction>
+    pub tx_context_keys: Vec<Pubkey>,
 }
 
 #[derive(Clone)]
@@ -466,21 +470,15 @@ invoke_syscall_stub!(
 impl Default for InstructionTrace {
     fn default() -> Self {
         Self {
-            entries: vec![],
             result: InstructionResult::default(),
-            address_space: vec![],
-            conf: vec![],
             feature_set: FeatureSet::default(),
             compute_budget: ComputeBudget::default(),
             registered_syscalls: BTreeMap::new(),
-            cu_initial_value: vec![],
-            cu_meter_final_value: vec![],
             cpi_calls: vec![],
             cur_frame: 0,
             cpi_caller: vec![],
             tx_context_keys: vec![],
-            instructions: vec![],
-            return_data: BTreeMap::new()
+            frames: vec![]
         }
     }
 }
@@ -594,22 +592,33 @@ impl InstructionTrace {
         TRACE_IN_PROGRESS.with(|addr| addr.replace(self as *mut Self));
     }
 
-    fn push_frame(&mut self, cu_meter: u64) {
+    fn push_frame(&mut self, instruction: Instruction, cu_meter: u64) {
         let caller = self.cur_frame;
-        let calee = self.address_space.len();
+        let calee = self.frames.len();
 
-        self.entries.push(vec![]);
-        self.address_space.push(AddressSpace::default());
+        self.frames.push(InstructionFrame {
+            cu_meter_final_value: cu_meter.into(),
+            cu_meter_initial_value: cu_meter.into(),
+            conf: InstructionConf::default(),
+            instruction,
+            entries: vec![],
+            address_space: AddressSpace::default(),
+        });
 
         self.cpi_caller.push(caller);
         self.cur_frame = calee;
-
-        self.cu_initial_value.push(cu_meter.into());
-        self.cu_meter_final_value.push(cu_meter.into());
     }
 
     fn pop_frame(&mut self) {
         self.cur_frame = self.cpi_caller.pop().unwrap();
+    }
+
+    fn cur_frame_mut(&mut self) -> &mut InstructionFrame {
+        &mut self.frames[self.cur_frame]
+    }
+
+    fn cur_frame(&self) -> &InstructionFrame {
+        &self.frames[self.cur_frame]
     }
  
     fn prepare(&mut self,
@@ -643,22 +652,24 @@ impl InstructionTrace {
 
         let runtime_features = self.feature_set.runtime_features();
         let heap_size = self.compute_budget.heap_size as usize;
-        self.push_frame(solana_sbpf::vm::ContextObject::get_remaining(invoke_context));
-        self.cu_initial_value[self.cur_frame].consume_cu(calculate_heap_cost(heap_size as u32, self.compute_budget.to_cost().heap_cost));
+        self.push_frame(
+            Instruction {
+                program_id: *program_id,
+                data: instruction_data.to_vec(),
+                accounts: instruction_accounts
+                    .iter()
+                    .map(|acc|
+                        AccountMeta {
+                            pubkey: self.tx_context_keys[acc.index_in_transaction as usize],
+                            is_writable: acc.is_writable,
+                            is_signer: acc.is_signer
+                        }).collect()
+            },
+            solana_sbpf::vm::ContextObject::get_remaining(invoke_context));
+        let heap_cost = self.compute_budget.to_cost().heap_cost;
+        self.cur_frame_mut().cu_meter_initial_value.consume_cu(calculate_heap_cost(heap_size as u32, heap_cost));
 
-        let address_space = self.address_space.last_mut().unwrap();
-        self.instructions.push(Instruction {
-            program_id: *program_id,
-            data: instruction_data.to_vec(),
-            accounts: instruction_accounts
-                .iter()
-                .map(|acc|
-                    AccountMeta {
-                        pubkey: self.tx_context_keys[acc.index_in_transaction as usize],
-                        is_writable: acc.is_writable,
-                        is_signer: acc.is_signer
-                    }).collect()
-            });
+        let mut address_space = AddressSpace::default();
 
         match cache_entry_type  {
             solana_program_runtime::loaded_programs::ProgramCacheEntryType::Loaded(executable) => {
@@ -698,10 +709,10 @@ impl InstructionTrace {
                 );
                 address_space.mem.push(stack_memory);
 
-                self.conf.push(InstructionConf{
+                self.cur_frame_mut().conf = InstructionConf{
                     move_memory_instruction_classes: executable.get_sbpf_version().move_memory_instruction_classes(),
                     loader_v1
-                });
+                };
             },
             _ => panic!("{}", MolluskError::ProgramNotCached(&program_id))
         };
@@ -717,37 +728,40 @@ impl InstructionTrace {
         address_space.regions.extend(regions.into_iter());
         address_space.accounts = accounts_metadata;
 
+        self.cur_frame_mut().address_space = address_space;
+
         Ok(self.cur_frame)
     }
 
     fn finalize_frame(&mut self, ctx: &InvokeContext) -> Result<(), EmulationError> {
         let frame_number = self.cur_frame;
-        let mut cu_meter = self.cu_initial_value[frame_number].clone();
         self.pop_frame();
+        let frame = &mut self.frames[frame_number];
+        let mut cu_meter = frame.cu_meter_initial_value.clone();
 
         let trace = ctx.get_traces().last().unwrap();
-        self.entries[frame_number] = trace.iter().map(
-            |regs| TraceEntry::new(regs, &self.address_space[frame_number]))
+        frame.entries = trace.iter().map(
+            |regs| TraceEntry::new(regs, &frame.address_space))
                 .collect::<Vec<TraceEntry>>();
-        let mut address_space = self.address_space[frame_number].clone();
+        let mut address_space = frame.address_space.clone();
         let mut cpi_entries = self.cpi_calls.clone().into_iter().filter(|x| x.caller_frame == frame_number);
 
         let cost = self.compute_budget.to_cost();
-        for i in 0..self.entries[frame_number].len() {
+        for i in 0..frame.entries.len() {
             let cu_before = cu_meter.clone();
             cu_meter.consume_cu(1);
             {
-                let slice = &mut self.entries[frame_number][i..];
+                let slice = &mut frame.entries[i..];
                 let (fs, sc) = slice.split_at_mut(1);
                 if !sc.is_empty() && !fs.is_empty() {
                     fs[0].regs_after = sc[0].regs_before;
                 }
             }
 
-            let cur = &mut self.entries[frame_number][i];
+            let cur = &mut frame.entries[i];
             cur.cu_meter_before = cu_before;
             cur.cu_meter = cu_meter.clone();
-            cur.fill_memory_access(&address_space, self.conf[frame_number].move_memory_instruction_classes)?;
+            cur.fill_memory_access(&address_space, frame.conf.move_memory_instruction_classes)?;
 
             {
                 let mut selected_call: Option<&str> = None;
@@ -778,7 +792,7 @@ impl InstructionTrace {
         }
         assert!(cpi_entries.next().is_none());
 
-        self.cu_meter_final_value[frame_number] = cu_meter;
+        frame.cu_meter_final_value = cu_meter;
 
         Ok(())
     }

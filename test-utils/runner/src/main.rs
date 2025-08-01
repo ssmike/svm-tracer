@@ -91,14 +91,14 @@ fn main() {
     // Execute the instruction and get the result.
     let trace = InstructionTraceBuilder::build(&mut mollusk, &instruction, &accounts).expect("trace build error");
 
-    println!("cu meters {} {} difference {}",  trace.cu_initial_value[0], trace.cu_meter_final_value[0], trace.cu_initial_value[0].diff(&trace.cu_meter_final_value[0]));
+    println!("cu meters {} {} difference {}",  trace.frames[0].cu_meter_initial_value, trace.frames[0].cu_meter_final_value, trace.frames[0].cu_meter_initial_value.diff(&trace.frames[0].cu_meter_final_value));
     let result = trace.result;
     println!("Hello, mollusk! \n{result:?}");
 
-    for trace in trace.entries {
+    for frame in &trace.frames {
         println!("frame");
-        for entry in trace {
-            let mem = entry.mem;
+        for entry in &frame.entries {
+            let mem = &entry.mem;
             //println!("{mem:?}")
         }
     }
